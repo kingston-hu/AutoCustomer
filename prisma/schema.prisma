@@ -1,0 +1,255 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model ai_model_configs {
+  id                 String   @id
+  name               String
+  provider           String
+  model_name         String
+  api_key_encrypted  String
+  capabilities       String?  @default("")
+  default_for        String?
+  maxTokens          Int      @default(4096)
+  temperature        Float    @default(0.7)
+  cost_per_1k_tokens Float?
+  is_active          Boolean  @default(true)
+  usage_stats        Json?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime
+}
+
+model campaign_leads {
+  id          String    @id
+  campaign_id String
+  lead_id     String
+  leads       leads     @relation(fields: [lead_id], references: [id], onDelete: Cascade)
+  campaigns   campaigns @relation(fields: [campaign_id], references: [id], onDelete: Cascade)
+
+  @@unique([campaign_id, lead_id])
+}
+
+model campaigns {
+  id              String           @id
+  name            String
+  description     String?
+  type            String
+  config          Json
+  target_count    Int              @default(0)
+  status          String           @default("DRAFT")
+  scheduled_at    DateTime?
+  started_at      DateTime?
+  completed_at    DateTime?
+  total_sent      Int              @default(0)
+  total_replied   Int              @default(0)
+  total_converted Int              @default(0)
+  creator_id      String
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime
+  campaign_leads  campaign_leads[]
+  users           users            @relation(fields: [creator_id], references: [id])
+  outreach_logs   outreach_logs[]
+  workflow_runs   workflow_runs[]
+}
+
+model developer_projects {
+  id               String     @id
+  developer_id     String
+  name             String
+  description      String?
+  url              String
+  stars            Int        @default(0)
+  language         String?
+  topics           String?    @default("")
+  is_fork          Boolean    @default(false)
+  primary_language String?
+  updated_at       String?
+  developers       developers @relation(fields: [developer_id], references: [id], onDelete: Cascade)
+}
+
+model developers {
+  id                    String               @id
+  githubId              String?              @unique
+  username              String               @unique
+  display_name          String?
+  bio                   String?
+  avatar_url            String?
+  location              String?
+  company               String?
+  blog                  String?
+  profileAnalysis       Json?
+  skillTags             String               @default("")
+  techStack             String               @default("")
+  languageStats         Json?
+  overallScore          Float                @default(0)
+  activityScore         Float                @default(0)
+  expertiseScore        Float                @default(0)
+  fitScore              Float                @default(0)
+  status                String               @default("NEW")
+  priority              String               @default("MEDIUM")
+  notes                 String?
+  assigned_to           String?
+  last_sync_at          DateTime?
+  rawData               Json?
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime
+  contactLinks          String?              @default("")
+  email                 String?              @default("")
+  commercialization_fit Float?
+  fit_grade             String?
+  listing_eligibility   String?
+  listing_readiness     Float?
+  platform_bonus        Float?
+  recommended_action    String?
+  reliability_activity  Float?
+  risk_penalty          Float?
+  target_categories     String?              @default("")
+  technical_fit         Float?
+  use_case_fit          Float?
+  developer_projects    developer_projects[]
+}
+
+model interactions {
+  id            String   @id
+  target_type   String
+  target_id     String
+  type          String
+  direction     String
+  content       String
+  summary       String?
+  metadata      Json?
+  ai_suggestion String?
+  sentiment     String?
+  createdAt     DateTime @default(now())
+
+  @@index([target_type, target_id])
+}
+
+model leads {
+  id              String           @id
+  source_type     String
+  source_id       String?
+  source_url      String?
+  company_name    String?
+  contact_name    String?
+  contact_email   String?
+  contact_phone   String?
+  contact_title   String?
+  website         String?
+  linkedin_url    String?
+  industry        String?
+  company_size    String?
+  annual_revenue  String?
+  ai_category     String?
+  aiAnalysis      Json?
+  painPoints      String?          @default("")
+  potential_value Int?
+  stage           String           @default("NEW")
+  assigned_to     String?
+  contacted_at    DateTime?
+  followup_at     DateTime?
+  warm_score      Int              @default(0)
+  notes           String?
+  tags            String?          @default("")
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime
+  campaign_leads  campaign_leads[]
+
+  @@index([stage])
+  @@index([ai_category])
+  @@index([source_type, source_id])
+}
+
+model outreach_logs {
+  id            String     @id
+  target_type   String
+  target_id     String
+  channel       String
+  subject       String?
+  body          String?
+  template_id   String?
+  ai_generated  Boolean    @default(false)
+  ai_prompt     String?
+  ai_model_used String?
+  status        String     @default("PENDING")
+  sent_at       DateTime?
+  delivered_at  DateTime?
+  opened_at     DateTime?
+  replied_at    DateTime?
+  bounced_at    DateTime?
+  error         String?
+  campaign_id   String?
+  sent_by       String?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime
+  campaigns     campaigns? @relation(fields: [campaign_id], references: [id])
+
+  @@index([status])
+  @@index([target_type, target_id])
+}
+
+model task_queue {
+  id           String    @id
+  type         String
+  payload      Json
+  status       String    @default("PENDING")
+  priority     Int       @default(5)
+  retry_count  Int       @default(0)
+  max_retries  Int       @default(3)
+  scheduled_at DateTime?
+  started_at   DateTime?
+  completed_at DateTime?
+  error        String?
+  result       Json?
+  createdAt    DateTime  @default(now())
+
+  @@index([status, type, scheduled_at])
+}
+
+model users {
+  id          String      @id
+  email       String      @unique
+  name        String?
+  avatar_url  String?
+  role        String      @default("USER")
+  preferences Json?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime
+  campaigns   campaigns[]
+}
+
+model workflow_definitions {
+  id            String          @id
+  name          String
+  description   String?
+  type          String
+  definition    Json
+  version       Int             @default(1)
+  is_active     Boolean         @default(true)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime
+  workflow_runs workflow_runs[]
+}
+
+model workflow_runs {
+  id                   String               @id
+  workflow_id          String
+  campaign_id          String?
+  status               String               @default("PENDING")
+  current_step         String?
+  context              Json?
+  result               Json?
+  error                String?
+  logs                 Json?
+  started_at           DateTime?
+  completed_at         DateTime?
+  campaigns            campaigns?           @relation(fields: [campaign_id], references: [id])
+  workflow_definitions workflow_definitions @relation(fields: [workflow_id], references: [id])
+
+  @@index([status])
+}

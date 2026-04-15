@@ -1,0 +1,161 @@
+# =========================
+# Dependencies
+# =========================
+node_modules/
+
+# =========================
+# Next.js build outputs
+# =========================
+.next/
+out/
+dist/
+
+# =========================
+# TypeScript / build cache
+# =========================
+*.tsbuildinfo
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# Keep template only
+!.env.example
+
+# =========================
+# Database / SQLite
+# =========================
+prisma/dev.db
+prisma/*.db
+prisma/*.db-journal
+prisma/*.db-wal
+prisma/*.db-shm
+
+# Optional: keep schema + migrations only
+!prisma/schema.prisma
+!prisma/migrations/
+!prisma/migrations/**
+
+# =========================
+# Logs
+# =========================
+*.log
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Explicit project logs
+.next-dev.log
+batch-import-*.log
+email-backfill*.log
+build-*.log
+dev-*.log
+tsc_*.txt
+tsc-output.txt
+tsc-check.log
+prisma_gen.txt
+
+# =========================
+# Generated business data / exports
+# =========================
+*-batch-*.csv
+*-batch-*.json
+invalid-email-cleanup*.json
+
+# =========================
+# Debug / one-off scripts
+# =========================
+_debug_*
+_check_*
+_run_*
+_start_*
+_clean_*
+_mark_*
+_find_*
+_verify_*
+_bulk_*
+_pick_*
+_launch_*
+_today_*
+_yesterday_*
+_add-template.js
+_fix-params.js
+_progress_check.mjs
+
+# =========================
+# Temporary / manual test files
+# =========================
+test-*.mjs
+test-*.txt
+test-*.js
+test-*.json
+
+# =========================
+# AI / debug response dumps
+# =========================
+debug-ai-responses/
+
+# =========================
+# OS / editor files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# Archive files
+# =========================
+*.zip
+*.tar
+*.gz
+*.7z
+
+# =========================
+# Runtime / pid
+# =========================
+*.pid
+
+# =========================
+# Keep important project files
+# =========================
+!.gitignore
+!README.md
+!package.json
+!package-lock.json
+!tsconfig.json
+!next.config.ts
+!next-env.d.ts
+!postcss.config.mjs
+!eslint.config.mjs
+!components.json
+!docker-compose.yml
+!AGENTS.md
+!CLAUDE.md
+
+# Keep source / public / prisma schema & migrations
+!src/
+!src/**
+!public/
+!public/**
+!prisma/
+!prisma/schema.prisma
+!prisma/migrations/
+!prisma/migrations/**
+
+
+# Ignore one-off root scripts and generated batch files
+_*
+*.csv
+*.json
+!components.json
