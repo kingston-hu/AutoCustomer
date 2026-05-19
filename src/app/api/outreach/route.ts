@@ -1,8 +1,9 @@
-import Database from "better-sqlite3";
+import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { Channel, SendStatus } from "@/lib/constants";
 import { sendTemplateEmail, sendEmail } from "@/services/email/service";
+
 
 function escapeCsv(value: unknown) {
   const text = String(value ?? "");
@@ -54,8 +55,13 @@ export async function GET(request: NextRequest) {
     const quickFilter = searchParams.get("quickFilter")?.trim();
     const startDate = searchParams.get("startDate")?.trim();
     const endDate = searchParams.get("endDate")?.trim();
+    const batchId = searchParams.get("batchId")?.trim();
+    const runId = searchParams.get("runId")?.trim();
+    const reasonCode = searchParams.get("reasonCode")?.trim();
 
+    const Database = require("better-sqlite3") as any;
     const sqlite = new Database("prisma/dev.db", { readonly: true });
+
 
     const whereClauses: string[] = [];
     const whereParams: Array<string | number> = [];
@@ -117,9 +123,26 @@ export async function GET(request: NextRequest) {
         OR LOWER(COALESCE(d.email, '')) LIKE ?
         OR LOWER(COALESCE(d.username, '')) LIKE ?
         OR LOWER(COALESCE(d.display_name, '')) LIKE ?
+        OR LOWER(COALESCE(wri.email, '')) LIKE ?
+        OR LOWER(COALESCE(wri.reason_code, '')) LIKE ?
       )`);
       const keyword = `%${search.toLowerCase()}%`;
-      whereParams.push(keyword, keyword, keyword, keyword, keyword, keyword);
+      whereParams.push(keyword, keyword, keyword, keyword, keyword, keyword, keyword, keyword);
+    }
+
+    if (batchId) {
+      whereClauses.push("(wri.batch_id = ? OR ol.ai_prompt LIKE ?)");
+      whereParams.push(batchId, `%${batchId}%`);
+    }
+
+    if (runId) {
+      whereClauses.push("wri.run_id = ?");
+      whereParams.push(runId);
+    }
+
+    if (reasonCode) {
+      whereClauses.push("wri.reason_code = ?");
+      whereParams.push(reasonCode);
     }
 
     const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
@@ -127,6 +150,7 @@ export async function GET(request: NextRequest) {
     const baseSql = `
       FROM outreach_logs ol
       LEFT JOIN developers d ON ol.target_type = 'DEVELOPER' AND ol.target_id = d.id
+      LEFT JOIN workflow_run_items wri ON wri.target_id = ol.target_id AND wri.target_type = ol.target_type
       ${whereSql}
     `;
 
@@ -144,8 +168,12 @@ export async function GET(request: NextRequest) {
         d.email AS developerEmail,
         d.display_name AS developerName,
         d.username AS developerUsername,
-        CASE WHEN d.username IS NOT NULL AND d.username <> '' THEN 'https://github.com/' || d.username ELSE NULL END AS githubUrl
+        CASE WHEN d.username IS NOT NULL AND d.username <> '' THEN 'https://github.com/' || d.username ELSE NULL END AS githubUrl,
+        wri.run_id AS runId,
+        wri.batch_id AS batchId,
+        wri.reason_code AS reasonCode
       ${baseSql}
+      GROUP BY ol.id
       ORDER BY ol.createdAt DESC
       ${exportMode ? "" : "LIMIT ? OFFSET ?"}
     `;
@@ -153,17 +181,20 @@ export async function GET(request: NextRequest) {
     const logsParams = exportMode ? whereParams : [...whereParams, limit, (page - 1) * limit];
     const logs = sqlite.prepare(logsSql).all(...logsParams).map((log: any) => ({
       ...log,
-      ...parseBatchMeta(log.ai_prompt),
+      batchId: log.batchId || parseBatchMeta(log.ai_prompt).batchId,
     }));
 
     if (exportMode) {
-      const header = ["发送时间", "发信邮箱", "开发者邮箱", "开发者名称", "GitHub主页", "主题", "正文", "发送状态", "失败原因"];
+      const header = ["发送时间", "发信邮箱", "开发者邮箱", "开发者名称", "GitHub主页", "批次ID", "运行ID", "原因码", "主题", "正文", "发送状态", "失败原因"];
       const rows = logs.map((log: any) => [
         log.sent_at || log.createdAt || "",
         log.senderEmail || "",
         log.developerEmail || "",
         log.developerName || log.developerUsername || "",
         log.githubUrl || "",
+        log.batchId || "",
+        log.runId || "",
+        log.reasonCode || "",
         log.subject || "",
         log.body || "",
         log.status || "",
@@ -180,7 +211,7 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    const totalRow = sqlite.prepare(`SELECT COUNT(*) as total ${baseSql}`).get(...whereParams) as { total: number };
+    const totalRow = sqlite.prepare(`SELECT COUNT(DISTINCT ol.id) as total ${baseSql}`).get(...whereParams) as { total: number };
     const channelStats = sqlite.prepare(`
       SELECT ol.channel, ol.status, COUNT(*) as count
       FROM outreach_logs ol

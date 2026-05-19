@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   Card,
   CardContent,
@@ -46,7 +46,10 @@ import {
   ArrowUpRight,
   Zap,
   UserPlus,
+  Upload,
+  FileSpreadsheet,
 } from "lucide-react";
+import * as XLSX from "xlsx";
 
 interface OutreachLog {
   id: string;
@@ -69,6 +72,24 @@ interface OutreachLog {
   createdAt: string;
 }
 
+type ImportedLeadRow = {
+  name: string;
+  email: string;
+  company?: string;
+  title?: string;
+  notes?: string;
+};
+
+type ImportSummary = {
+  fileName: string;
+  parsed: number;
+  imported: number;
+  skippedExisting: number;
+  duplicateCount: number;
+  invalidCount: number;
+  invalidRows: Array<{ row: number; email: string }>;
+};
+
 const CHANNEL_CONFIG: Record<string, { label: string; icon: React.ReactNode; gradient: string }> = {
   EMAIL: { label: "邮件", icon: <Mail className="w-3.5 h-3.5" />, gradient: "from-blue-500 to-indigo-500" },
   LINKEDIN_DM: { label: "LinkedIn", icon: <MessageSquare className="w-3.5 h-3.5" />, gradient: "from-sky-500 to-cyan-500" },
@@ -90,17 +111,65 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; bg: string; 
   CANCELLED: { label: "已取消", color: "text-gray-400 dark:text-gray-500", bg: "bg-gray-100/50 dark:bg-gray-800/30", dotColor: "bg-gray-300", icon: <Clock className="w-3 h-3" /> },
 };
 
-// Timeline step component
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
+const NAME_KEYS = ["name", "姓名", "联系人", "联系人姓名", "称呼"];
+const EMAIL_KEYS = ["email", "邮箱", "电子邮箱", "mail", "邮箱地址"];
+const COMPANY_KEYS = ["company", "公司", "机构", "organization"];
+const TITLE_KEYS = ["title", "职位", "岗位"];
+const NOTES_KEYS = ["notes", "备注", "说明"];
+
+function normalizeHeader(value: unknown) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function findValue(record: Record<string, unknown>, candidates: string[]) {
+  for (const [key, value] of Object.entries(record)) {
+    const normalizedKey = normalizeHeader(key);
+    if (candidates.some((candidate) => normalizeHeader(candidate) === normalizedKey)) {
+      return String(value || "").trim();
+    }
+  }
+  return "";
+}
+
+function parseImportedLeads(rows: Record<string, unknown>[]) {
+  const importedRows: ImportedLeadRow[] = [];
+  const invalidRows: Array<{ row: number; email: string }> = [];
+
+  rows.forEach((row, index) => {
+    const email = findValue(row, EMAIL_KEYS).toLowerCase();
+    const name = findValue(row, NAME_KEYS);
+    const company = findValue(row, COMPANY_KEYS);
+    const title = findValue(row, TITLE_KEYS);
+    const notes = findValue(row, NOTES_KEYS);
+
+    if (!email || !EMAIL_REGEX.test(email)) {
+      invalidRows.push({ row: index + 2, email });
+      return;
+    }
+
+    importedRows.push({
+      email,
+      name: name || email.split("@")[0],
+      company: company || undefined,
+      title: title || undefined,
+      notes: notes || undefined,
+    });
+  });
+
+  return { importedRows, invalidRows };
+}
+
 function TimelineStep({ label, time, isActive, isLast, color }: { label: string; time?: string | null; isActive: boolean; isLast: boolean; color: string }) {
   return (
     <div className="flex items-start gap-3">
       <div className="flex flex-col items-center">
-        <div className={`w-2.5 h-2.5 rounded-full ring-2 ring-background ${isActive ? color : 'bg-muted'}`} />
-        {!isLast && <div className={`w-0.5 h-6 mt-1 ${isActive ? `bg-${color.split('-')[1]}-200 dark:bg-${color.split('-')[1]}-800` : 'bg-muted'}`} />}
+        <div className={`w-2.5 h-2.5 rounded-full ring-2 ring-background ${isActive ? color : "bg-muted"}`} />
+        {!isLast && <div className={`w-0.5 h-6 mt-1 ${isActive ? `bg-${color.split("-")[1]}-200 dark:bg-${color.split("-")[1]}-800` : "bg-muted"}`} />}
       </div>
       <div className="flex-1 pb-4">
-        <p className={`text-xs font-medium ${isActive ? 'text-foreground' : 'text-muted-foreground'}`}>{label}</p>
-        {time && <p className={`text-[11px] font-mono ${isActive ? 'text-foreground/70' : 'text-muted-foreground/60'} mt-0.5`}>{new Date(time).toLocaleString("zh-CN")}</p>}
+        <p className={`text-xs font-medium ${isActive ? "text-foreground" : "text-muted-foreground"}`}>{label}</p>
+        {time && <p className={`text-[11px] font-mono ${isActive ? "text-foreground/70" : "text-muted-foreground/60"} mt-0.5`}>{new Date(time).toLocaleString("zh-CN")}</p>}
       </div>
     </div>
   );
@@ -115,7 +184,6 @@ export default function OutreachPage() {
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
 
-  // Compose dialog
   const [composeOpen, setComposeOpen] = useState(false);
   const [composeForm, setComposeForm] = useState({
     targetType: "LEAD",
@@ -128,12 +196,13 @@ export default function OutreachPage() {
   const [sending, setSending] = useState(false);
   const [targets, setTargets] = useState<Array<{ id: string; displayName: string; email: string | null }>>([]);
 
-  // 手动输入邮箱模式
   const [manualEmailMode, setManualEmailMode] = useState(false);
   const [manualEmail, setManualEmail] = useState("");
   const [manualName, setManualName] = useState("");
+  const [importingXlsx, setImportingXlsx] = useState(false);
+  const [importSummary, setImportSummary] = useState<ImportSummary | null>(null);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Detail view
   const [selectedLog, setSelectedLog] = useState<OutreachLog | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
 
@@ -160,51 +229,110 @@ export default function OutreachPage() {
     }
   }, [page, search, channelFilter, statusFilter]);
 
+  const fetchTargets = useCallback(async () => {
+    const apiUrl = composeForm.targetType === "DEVELOPER" ? "/api/developers?limit=100" : "/api/leads?limit=100";
+    const res = await fetch(apiUrl);
+    const data = await res.json();
+    if (composeForm.targetType === "DEVELOPER") {
+      setTargets((data.data || []).map((d: any) => ({
+        id: d.id,
+        displayName: d.displayName || d.username || d.id,
+        email: d.email || null,
+      })));
+    } else {
+      setTargets((data.data || []).map((l: any) => ({
+        id: l.id,
+        displayName: l.contactName || l.name || l.companyName || l.id,
+        email: l.contactEmail || l.email || null,
+      })));
+    }
+  }, [composeForm.targetType]);
+
   useEffect(() => {
     fetchLogs();
   }, [fetchLogs]);
 
-  // Fetch targets for compose (switches API based on targetType)
   useEffect(() => {
     if (composeOpen) {
-      const apiUrl = composeForm.targetType === "DEVELOPER"
-        ? "/api/developers?limit=100"
-        : "/api/leads?limit=50";
-
-      fetch(apiUrl)
-        .then((res) => res.json())
-        .then((data) => {
-          if (composeForm.targetType === "DEVELOPER") {
-            // /api/developers returns { data: [...], ... }
-            setTargets((data.data || []).map((d: any) => ({
-              id: d.id,
-              displayName: d.displayName || d.username || d.id,
-              email: d.email || null,
-            })));
-          } else {
-            // /api/leads returns { data: [...], ... }
-            setTargets((data.data || []).map((l: any) => ({
-              id: l.id,
-              displayName: l.contactName || l.name || l.companyName || l.id,
-              email: l.contactEmail || l.email || null,
-            })));
-          }
-        })
-        .catch(() => {});
-      // Reset target selection when type changes
+      fetchTargets().catch(() => {});
       if (composeForm.targetId) {
-        setComposeForm(prev => ({ ...prev, targetId: "" }));
+        setComposeForm((prev) => ({ ...prev, targetId: "" }));
       }
     }
-  }, [composeOpen, composeForm.targetType]);
+  }, [composeOpen, composeForm.targetType, fetchTargets]);
+
+  const handleImportXlsx = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (!file.name.toLowerCase().endsWith(".xlsx")) {
+      alert("请上传 .xlsx 文件");
+      event.target.value = "";
+      return;
+    }
+
+    setImportingXlsx(true);
+    setImportSummary(null);
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const workbook = XLSX.read(buffer, { type: "array" });
+      const firstSheet = workbook.SheetNames[0];
+      if (!firstSheet) {
+        alert("Excel 中没有可读取的工作表");
+        return;
+      }
+
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(workbook.Sheets[firstSheet], { defval: "" });
+      if (rows.length === 0) {
+        alert("Excel 中没有可导入的数据");
+        return;
+      }
+
+      const { importedRows, invalidRows } = parseImportedLeads(rows);
+      if (importedRows.length === 0) {
+        alert(`没有找到可导入的有效邮箱。无效行数：${invalidRows.length}`);
+        return;
+      }
+
+      const res = await fetch("/api/leads/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: importedRows }),
+      });
+
+      const result = await res.json();
+      if (!res.ok) {
+        alert(result.error || "导入联系人草稿失败");
+        return;
+      }
+
+      setComposeForm((prev) => ({ ...prev, targetType: "LEAD", targetId: "" }));
+      setManualEmailMode(false);
+      setImportSummary({
+        fileName: file.name,
+        parsed: importedRows.length,
+        imported: result.imported || 0,
+        skippedExisting: result.skippedExisting || 0,
+        duplicateCount: result.duplicateCount || 0,
+        invalidCount: invalidRows.length + (result.invalidCount || 0),
+        invalidRows: [...invalidRows, ...(result.invalidRows || [])].slice(0, 10),
+      });
+
+      await fetchTargets();
+    } catch (error) {
+      console.error("Import xlsx failed:", error);
+      alert("导入 .xlsx 联系人失败，请检查文件格式");
+    } finally {
+      if (event.target) event.target.value = "";
+      setImportingXlsx(false);
+    }
+  };
 
   const handleSend = async () => {
-    // 校验：手动模式检查邮箱，选择模式检查 targetId
     if (manualEmailMode) {
       if (!manualEmail.trim() || !composeForm.body) return;
-      // 简单的邮箱格式校验
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(manualEmail.trim())) {
+      if (!EMAIL_REGEX.test(manualEmail.trim())) {
         alert("请输入有效的邮箱地址");
         return;
       }
@@ -214,7 +342,6 @@ export default function OutreachPage() {
 
     setSending(true);
     try {
-      // 手动模式：将邮箱作为自定义目标传递
       const payload = manualEmailMode
         ? {
             ...composeForm,
@@ -233,10 +360,10 @@ export default function OutreachPage() {
       if (res.ok) {
         setComposeOpen(false);
         setComposeForm({ targetType: "LEAD", targetId: "", channel: "EMAIL", subject: "", body: "", templateId: "" });
-        // 重置手动输入状态
         setManualEmailMode(false);
         setManualEmail("");
         setManualName("");
+        setImportSummary(null);
         fetchLogs();
       } else {
         const err = await res.json();
@@ -249,7 +376,6 @@ export default function OutreachPage() {
     }
   };
 
-  // Stats
   const stats = {
     total: total || logs.length,
     sent: logs.filter((l) => ["SENT", "DELIVERED"].includes(l.status)).length,
@@ -260,7 +386,6 @@ export default function OutreachPage() {
 
   return (
     <div className="space-y-6">
-      {/* ===== Header — Brand Gradient ===== */}
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2.5">
@@ -283,9 +408,9 @@ export default function OutreachPage() {
           <DialogContent className="sm:max-w-[560px]">
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2">
-                  <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-500 flex items-center justify-center">
-                    <Send className="w-4 h-4 text-white" />
-                  </div>
+                <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-500 flex items-center justify-center">
+                  <Send className="w-4 h-4 text-white" />
+                </div>
                 新建外联消息
               </DialogTitle>
               <DialogDescription>向目标发送邮件或消息</DialogDescription>
@@ -294,10 +419,7 @@ export default function OutreachPage() {
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label>目标类型</Label>
-                  <Select
-                    value={composeForm.targetType}
-                    onValueChange={(v) => setComposeForm({ ...composeForm, targetType: v || "LEAD", targetId: "" })}
-                  >
+                  <Select value={composeForm.targetType} onValueChange={(v) => setComposeForm({ ...composeForm, targetType: v || "LEAD", targetId: "" })}>
                     <SelectTrigger className="rounded-lg"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="LEAD">线索</SelectItem>
@@ -307,10 +429,7 @@ export default function OutreachPage() {
                 </div>
                 <div className="space-y-2">
                   <Label>渠道</Label>
-                  <Select
-                    value={composeForm.channel}
-                    onValueChange={(v) => setComposeForm({ ...composeForm, channel: v || "EMAIL" })}
-                  >
+                  <Select value={composeForm.channel} onValueChange={(v) => setComposeForm({ ...composeForm, channel: v || "EMAIL" })}>
                     <SelectTrigger className="rounded-lg"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="EMAIL">📧 邮件</SelectItem>
@@ -322,40 +441,59 @@ export default function OutreachPage() {
               </div>
 
               <div className="space-y-2">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
                   <Label>选择目标</Label>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 text-xs text-cyan-600 dark:text-cyan-400 hover:text-cyan-700 hover:bg-cyan-50 dark:hover:bg-cyan-950/30 gap-1"
-                    onClick={() => {
-                      setManualEmailMode(!manualEmailMode);
-                      if (!manualEmailMode) {
-                        // 切换到手动模式时清空选择
-                        setComposeForm(prev => ({ ...prev, targetId: "" }));
-                      } else {
-                        // 切换回选择模式时清空手动输入
-                        setManualEmail("");
-                        setManualName("");
-                      }
-                    }}
-                  >
-                    {manualEmailMode ? (
-                      <>从列表选择</>
-                    ) : (
-                      <><UserPlus className="w-3.5 h-3.5" /> 手动输入邮箱</>
-                    )}
-                  </Button>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <input ref={importInputRef} type="file" accept=".xlsx" className="hidden" onChange={handleImportXlsx} />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-xs text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 hover:bg-emerald-50 dark:hover:bg-emerald-950/30 gap-1"
+                      onClick={() => importInputRef.current?.click()}
+                      disabled={importingXlsx}
+                    >
+                      <FileSpreadsheet className="w-3.5 h-3.5" /> {importingXlsx ? "导入中..." : "导入 .xlsx 草稿"}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-xs text-cyan-600 dark:text-cyan-400 hover:text-cyan-700 hover:bg-cyan-50 dark:hover:bg-cyan-950/30 gap-1"
+                      onClick={() => {
+                        setManualEmailMode(!manualEmailMode);
+                        if (!manualEmailMode) {
+                          setComposeForm((prev) => ({ ...prev, targetId: "" }));
+                        } else {
+                          setManualEmail("");
+                          setManualName("");
+                        }
+                      }}
+                    >
+                      {manualEmailMode ? <>从列表选择</> : <><UserPlus className="w-3.5 h-3.5" /> 手动输入邮箱</>}
+                    </Button>
+                  </div>
                 </div>
 
+                {importSummary && (
+                  <div className="rounded-lg border border-emerald-200/60 bg-emerald-50/70 dark:border-emerald-900/40 dark:bg-emerald-950/20 p-3 space-y-1.5">
+                    <div className="flex items-center gap-2 text-sm font-medium text-emerald-800 dark:text-emerald-200">
+                      <Upload className="w-4 h-4" /> 已导入联系人草稿：{importSummary.fileName}
+                    </div>
+                    <p className="text-xs text-emerald-700/90 dark:text-emerald-300/90">
+                      解析 {importSummary.parsed} 条，新增 {importSummary.imported} 条，已存在跳过 {importSummary.skippedExisting} 条，文件内重复 {importSummary.duplicateCount} 条，无效邮箱 {importSummary.invalidCount} 条。
+                    </p>
+                    {importSummary.invalidRows.length > 0 && (
+                      <p className="text-[11px] text-amber-700 dark:text-amber-300">
+                        无效示例：{importSummary.invalidRows.map((item) => `第 ${item.row} 行`).join("、")}
+                      </p>
+                    )}
+                  </div>
+                )}
+
                 {!manualEmailMode ? (
-                  // 下拉选择模式
                   <>
-                    <Select
-                      value={composeForm.targetId}
-                      onValueChange={(v) => setComposeForm({ ...composeForm, targetId: v || "" })}
-                    >
+                    <Select value={composeForm.targetId} onValueChange={(v) => setComposeForm({ ...composeForm, targetId: v || "" })}>
                       <SelectTrigger className="rounded-lg"><SelectValue placeholder={`选择${composeForm.targetType === "DEVELOPER" ? "开发者" : "线索"}...`} /></SelectTrigger>
                       <SelectContent>
                         {targets.length === 0 ? (
@@ -370,39 +508,24 @@ export default function OutreachPage() {
                     {targets.length === 0 && composeOpen && (
                       <p className="text-xs text-muted-foreground mt-1">
                         {composeForm.targetType === "DEVELOPER"
-                          ? "提示：请先在开发者页面导入 GitHub 开发者数据，或切换为「手动输入邮箱」"
-                          : "提示：请先添加线索数据，或切换为「手动输入邮箱」"}
+                          ? "提示：请先在开发者页面导入 GitHub 开发者数据，或切换为“手动输入邮箱”"
+                          : "提示：请先添加线索数据，或通过“.xlsx 导入草稿”批量导入联系人"}
                       </p>
                     )}
                   </>
                 ) : (
-                  // 手动输入邮箱模式
                   <div className="space-y-2 rounded-lg border border-border/50 p-3 bg-muted/20">
                     <div className="grid grid-cols-[100px_1fr] gap-2 items-center">
                       <Label htmlFor="manualName" className="text-xs text-muted-foreground whitespace-nowrap">姓名 (可选)</Label>
-                      <Input
-                        id="manualName"
-                        placeholder="收件人姓名..."
-                        value={manualName}
-                        onChange={(e) => setManualName(e.target.value)}
-                        className="rounded-md h-9 text-sm"
-                      />
+                      <Input id="manualName" placeholder="收件人姓名..." value={manualName} onChange={(e) => setManualName(e.target.value)} className="rounded-md h-9 text-sm" />
                     </div>
                     <div className="grid grid-cols-[100px_1fr] gap-2 items-center">
                       <Label htmlFor="manualEmail" className="text-xs font-medium whitespace-nowrap">邮箱地址 *</Label>
-                      <Input
-                        id="manualEmail"
-                        type="email"
-                        placeholder="example@email.com"
-                        value={manualEmail}
-                        onChange={(e) => setManualEmail(e.target.value)}
-                        className="rounded-md h-9 text-sm border-cyan-200 focus:border-cyan-400 dark:border-cyan-800 dark:focus:border-cyan-500"
-                        autoFocus
-                      />
+                      <Input id="manualEmail" type="email" placeholder="example@email.com" value={manualEmail} onChange={(e) => setManualEmail(e.target.value)} className="rounded-md h-9 text-sm border-cyan-200 focus:border-cyan-400 dark:border-cyan-800 dark:focus:border-cyan-500" autoFocus />
                     </div>
                     <p className="text-[11px] text-muted-foreground flex items-center gap-1">
                       <Zap className="w-3 h-3 text-cyan-500" />
-                      直接输入任意邮箱即可发送，无需预先添加到系统
+                      直接输入单个邮箱可立即发送；如需批量整理，请先用“.xlsx 导入草稿”进入线索列表。
                     </p>
                   </div>
                 )}
@@ -410,29 +533,16 @@ export default function OutreachPage() {
 
               <div className="space-y-2">
                 <Label htmlFor="subject">主题</Label>
-                <Input
-                  id="subject"
-                  placeholder="邮件或消息主题..."
-                  value={composeForm.subject}
-                  onChange={(e) => setComposeForm({ ...composeForm, subject: e.target.value })}
-                  className="rounded-lg"
-                />
+                <Input id="subject" placeholder="邮件或消息主题..." value={composeForm.subject} onChange={(e) => setComposeForm({ ...composeForm, subject: e.target.value })} className="rounded-lg" />
               </div>
 
               <div className="space-y-2">
                 <Label htmlFor="body">内容</Label>
-                <Textarea
-                  id="body"
-                  rows={6}
-                  placeholder="输入消息内容..."
-                  value={composeForm.body}
-                  onChange={(e) => setComposeForm({ ...composeForm, body: e.target.value })}
-                  className="rounded-lg"
-                />
+                <Textarea id="body" rows={6} placeholder="输入消息内容..." value={composeForm.body} onChange={(e) => setComposeForm({ ...composeForm, body: e.target.value })} className="rounded-lg" />
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => { setComposeOpen(false); setManualEmailMode(false); setManualEmail(""); setManualName(""); }} className="rounded-lg">取消</Button>
+              <Button variant="outline" onClick={() => { setComposeOpen(false); setManualEmailMode(false); setManualEmail(""); setManualName(""); setImportSummary(null); }} className="rounded-lg">取消</Button>
               <Button onClick={handleSend} disabled={sending || (!manualEmailMode ? (!composeForm.targetId || !composeForm.body) : (!manualEmail.trim() || !composeForm.body))} className="bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-600 hover:to-blue-700 text-white rounded-lg">
                 {sending ? "发送中..." : <><Send className="w-4 h-4 mr-1" /> 发送</>}
               </Button>
@@ -441,7 +551,6 @@ export default function OutreachPage() {
         </Dialog>
       </div>
 
-      {/* ===== Stats Cards — Premium Horizontal ===== */}
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
         <Card className="overflow-hidden border-0 shadow-sm hover:shadow-md transition-all duration-300 group">
           <CardContent className="p-4 bg-gradient-to-br from-slate-50 to-gray-50 dark:from-slate-950/40 dark:to-gray-950/20 flex items-center justify-between">
@@ -501,7 +610,6 @@ export default function OutreachPage() {
         </Card>
       </div>
 
-      {/* ===== Funnel indicator bar ===== */}
       {(stats.sent > 0 || stats.opened > 0 || stats.replied > 0) && (
         <div className="flex items-center gap-1 p-3 rounded-xl bg-gradient-to-r from-slate-50 via-blue-50/30 to-emerald-50/30 dark:from-slate-950/20 dark:via-blue-950/10 dark:to-emerald-950/10 border border-border/50">
           <span className="text-[11px] text-muted-foreground font-medium mr-2 whitespace-nowrap">转化漏斗:</span>
@@ -509,298 +617,17 @@ export default function OutreachPage() {
             {[{ n: stats.sent, c: "blue", l: "发送" }, { n: stats.opened, c: "emerald", l: "打开" }, { n: stats.replied, c: "green", l: "回复" }].map((step, i) => (
               <div key={i} className="flex items-center gap-1.5 flex-1 min-w-0">
                 <div className={`flex-1 h-2 rounded-full bg-${step.c}-200/60 dark:bg-${step.c}-900/30 overflow-hidden`}>
-                  <div
-                    className={`h-full rounded-full bg-gradient-to-r from-${step.c}-400 to-${step.c}-500 transition-all duration-500`}
-                    style={{ width: `${stats.total > 0 ? (step.n / stats.total) * 100 : 0}%` }}
-                  />
+                  <div className={`h-full rounded-full bg-gradient-to-r from-${step.c}-400 to-${step.c}-500 transition-all duration-500`} style={{ width: `${stats.total > 0 ? (step.n / stats.total) * 100 : 0}%` }} />
                 </div>
-                <span className={`text-[10px] font-bold tabular-nums text-${step.c}-600 dark:text-${step.c}-400 whitespace-nowrap`}>
-                  {step.n}
-                </span>
+                <span className={`text-[10px] font-bold tabular-nums text-${step.c}-600 dark:text-${step.c}-400 whitespace-nowrap`}>{step.n}</span>
                 {i < 2 && <ArrowUpRight className="w-3 h-3 text-muted-foreground/40 shrink-0" />}
               </div>
             ))}
           </div>
-          {stats.total > 0 && (
-            <span className="text-[11px] font-bold tabular-nums text-emerald-600 dark:text-emerald-400 ml-2 shrink-0">
-              {Math.round((stats.replied / Math.max(stats.sent, 1)) * 100)}% 回复率
-            </span>
-          )}
         </div>
       )}
-
-      {/* ===== Filters ===== */}
-      <div className="flex flex-col sm:flex-row gap-3">
-        <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <Input
-            placeholder="搜索主题、内容..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="pl-9 rounded-xl bg-background/80 backdrop-blur-sm"
-          />
-        </div>
-        <Select value={channelFilter} onValueChange={(v) => { setChannelFilter(v || "all"); setPage(1); }}>
-          <SelectTrigger className="w-full sm:w-[140px] rounded-xl">
-            <SelectValue placeholder="渠道" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">全部渠道</SelectItem>
-            <SelectItem value="EMAIL">📧 邮件</SelectItem>
-            <SelectItem value="WECHAT">💬 微信</SelectItem>
-            <SelectItem value="LINKEDIN_DM">💼 LinkedIn</SelectItem>
-          </SelectContent>
-        </Select>
-        <Select value={statusFilter} onValueChange={(v) => { setStatusFilter(v || "all"); setPage(1); }}>
-          <SelectTrigger className="w-full sm:w-[140px] rounded-xl">
-            <SelectValue placeholder="状态" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">全部状态</SelectItem>
-            <SelectItem value="SENT">📤 已发送</SelectItem>
-            <SelectItem value="OPENED">👁 已打开</SelectItem>
-            <SelectItem value="REPLIED">✅ 已回复</SelectItem>
-            <SelectItem value="FAILED">❌ 失败</SelectItem>
-          </SelectContent>
-        </Select>
-        <Button variant="outline" size="icon" onClick={() => fetchLogs()} className="rounded-xl hover:bg-primary/10">
-          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-        </Button>
-      </div>
-
-      {/* ===== Logs Table / List ===== */}
-      {loading ? (
-        <Card className="border-0 shadow-sm overflow-hidden">
-          <CardContent className="py-6 space-y-3 px-5">
-            {[...Array(5)].map((_, i) => (
-              <div key={i} className="h-16 bg-muted/60 rounded-xl animate-pulse" />
-            ))}
-          </CardContent>
-        </Card>
-      ) : logs.length === 0 ? (
-        <Card className="border-dashed border-2 border-cyan-200/60 dark:border-cyan-800/30 bg-gradient-to-b from-cyan-50/30 to-transparent dark:from-cyan-950/10">
-          <CardContent className="flex flex-col items-center py-16">
-            <div className="w-16 h-16 rounded-2xl mx-auto bg-gradient-to-br from-cyan-100 to-blue-100 dark:from-cyan-900 dark:to-blue-900 flex items-center justify-center mb-4">
-              <Send className="w-8 h-8 text-cyan-500" />
-            </div>
-            <h3 className="font-semibold text-lg mb-1">还没有外联记录</h3>
-            <p className="text-sm text-muted-foreground mb-6 max-w-sm text-center">开始发送你的第一条外联消息，建立与目标客户的连接</p>
-            <Button onClick={() => setComposeOpen(true)} className="bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-600 hover:to-blue-700 text-white rounded-xl gap-2">
-              <Plus className="w-4 h-4" /> 发送第一条消息
-            </Button>
-          </CardContent>
-        </Card>
-      ) : (
-        <Card className="border-0 shadow-md overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead>
-                <tr className="border-b bg-muted/20">
-                  <th className="text-left px-4 py-3 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">渠道</th>
-                  <th className="text-left px-4 py-3 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">主题 & 内容</th>
-                  <th className="text-left px-4 py-3 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">状态</th>
-                  <th className="text-left px-4 py-3 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider hidden lg:table-cell">活动</th>
-                  <th className="text-left px-4 py-3 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider hidden md:table-cell">时间</th>
-                  <th className="text-right px-4 py-3 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {logs.map((log) => {
-                  const chCfg = CHANNEL_CONFIG[log.channel] || CHANNEL_CONFIG.EMAIL;
-                  const stCfg = STATUS_CONFIG[log.status] || STATUS_CONFIG.PENDING;
-
-                  return (
-                    <tr
-                      key={log.id}
-                      className="border-b border-border/30 hover:bg-muted/20 transition-colors cursor-pointer group"
-                      onClick={() => { setSelectedLog(log); setDetailOpen(true); }}
-                    >
-                      <td className="px-4 py-3">
-                        <Badge variant="outline" className={`gap-1.5 text-[11px] font-medium bg-gradient-to-r ${chCfg.gradient} text-white border-transparent shadow-sm`}>
-                          {chCfg.icon} {chCfg.label}
-                        </Badge>
-                      </td>
-                      <td className="px-4 py-3 max-w-[280px]">
-                        <div>
-                          <p className="font-medium text-sm truncate leading-snug">{log.subject || "(无主题)"}</p>
-                          <p className="text-[11px] text-muted-foreground truncate mt-0.5 leading-relaxed">
-                            {log.aiGenerated && <><Sparkles className="w-3 h-3 inline mr-0.5 text-amber-500" /></>}
-                            {log.body?.substring(0, 80) || "..."}
-                          </p>
-                        </div>
-                      </td>
-                      <td className="px-4 py-3">
-                        <Badge variant="outline" className={`gap-1.5 text-[11px] font-medium ${stCfg.bg} ${stCfg.color} border-transparent`}>
-                          <span className={`w-1.5 h-1.5 rounded-full ${stCfg.dotColor}`} />
-                          {stCfg.label}
-                        </Badge>
-                      </td>
-                      <td className="px-4 py-3 hidden lg:table-cell">
-                        <span className="text-sm text-muted-foreground">{log.campaign?.name || "-"}</span>
-                      </td>
-                      <td className="px-4 py-3 text-[12px] text-muted-foreground whitespace-nowrap font-mono hidden md:table-cell">
-                        {new Date(log.createdAt).toLocaleDateString("zh-CN")}
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          className="h-7 text-xs hover:bg-cyan-50 dark:hover:bg-cyan-950/30 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
-                          onClick={(e) => { e.stopPropagation(); setSelectedLog(log); setDetailOpen(true); }}
-                        >
-                          详情
-                        </Button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </Card>
-      )}
-
-      {/* ===== Pagination ===== */}
-      {!loading && total > 20 && (
-        <div className="flex items-center justify-between pt-4">
-          <p className="text-sm text-muted-foreground">
-            共 <span className="font-semibold tabular-nums">{total}</span> 条记录
-          </p>
-          <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage(page - 1)} className="rounded-lg">上一页</Button>
-            <span className="text-sm font-medium tabular-nums px-2">第 {page} 页</span>
-            <Button variant="outline" size="sm" disabled={page * 20 >= total} onClick={() => setPage(page + 1)} className="rounded-lg">下一页</Button>
-          </div>
-        </div>
-      )}
-
-      {/* ===== Detail Dialog — Premium Timeline ===== */}
-      <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
-        <DialogContent className="sm:max-w-[620px] max-h-[85vh] overflow-y-auto">
-          {selectedLog && (
-            <>
-              <DialogHeader>
-                <DialogTitle className="flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-500 flex items-center justify-center">
-                    <Mail className="w-4 h-4 text-white" />
-                  </div>
-                  外联详情
-                </DialogTitle>
-                <DialogDescription className="font-mono text-xs">
-                  ID: {selectedLog.id.substring(0, 12)}...
-                </DialogDescription>
-              </DialogHeader>
-
-              <div className="space-y-5 pt-2">
-                {/* Status & Channel Badges */}
-                <div className="flex flex-wrap gap-2">
-                  <Badge variant="outline" className={`gap-1.5 text-xs font-medium bg-gradient-to-r ${(CHANNEL_CONFIG[selectedLog.channel]?.gradient || "")} text-white border-transparent shadow-sm`}>
-                    {CHANNEL_CONFIG[selectedLog.channel]?.icon} {CHANNEL_CONFIG[selectedLog.channel]?.label}
-                  </Badge>
-                  <Badge variant="outline" className={`gap-1.5 text-xs font-medium ${STATUS_CONFIG[selectedLog.status]?.bg} ${STATUS_CONFIG[selectedLog.status]?.color} border-transparent`}>
-                    <span className={`w-1.5 h-1.5 rounded-full ${STATUS_CONFIG[selectedLog.status]?.dotColor}`} />
-                    {STATUS_CONFIG[selectedLog.status]?.icon} {STATUS_CONFIG[selectedLog.status]?.label}
-                  </Badge>
-                  {selectedLog.aiGenerated && (
-                    <Badge className="gap-1 text-xs font-medium bg-gradient-to-r from-amber-100 to-orange-100 dark:from-amber-900/40 dark:to-orange-900/40 text-amber-700 dark:text-amber-400 border-transparent">
-                      <Sparkles className="w-3 h-3" /> AI生成
-                    </Badge>
-                  )}
-                </div>
-
-                {/* Info Grid */}
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="rounded-xl bg-gradient-to-br from-slate-50 to-gray-50 dark:from-slate-950/20 dark:to-gray-950/10 p-3.5 space-y-1 border border-border/30">
-                    <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider">目标类型</p>
-                    <p className="text-sm font-semibold">{selectedLog.targetType}</p>
-                  </div>
-                  <div className="rounded-xl bg-gradient-to-br from-slate-50 to-gray-50 dark:from-slate-950/20 dark:to-gray-950/10 p-3.5 space-y-1 border border-border/30">
-                    <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider">活动关联</p>
-                    <p className="text-sm font-semibold">{selectedLog.campaign?.name || "未关联"}</p>
-                  </div>
-                  <div className="col-span-2 rounded-xl bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-blue-950/15 dark:to-indigo-950/10 p-3.5 space-y-1 border border-border/30">
-                    <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider">主题</p>
-                    <p className="text-sm font-semibold">{selectedLog.subject || "(无主题)"}</p>
-                  </div>
-                </div>
-
-                {/* Body Content */}
-                {selectedLog.body && (
-                  <div className="rounded-xl border border-border/30 overflow-hidden">
-                    <div className="bg-gradient-to-r from-muted/40 to-muted/20 px-4 py-2.5 flex items-center gap-2">
-                      <FileText className="w-3.5 h-3.5 text-muted-foreground" />
-                      <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">消息内容</h4>
-                    </div>
-                    <div className="bg-muted/10 p-4 text-sm whitespace-pre-wrap max-h-[220px] overflow-y-auto leading-relaxed">
-                      {selectedLog.body}
-                    </div>
-                  </div>
-                )}
-
-                {/* Timeline — Visual */}
-                <div className="rounded-xl border border-border/30 overflow-hidden">
-                  <div className="bg-gradient-to-r from-cyan-50/50 to-blue-50/30 dark:from-cyan-950/10 dark:to-blue-950/5 px-4 py-2.5 flex items-center gap-2">
-                    <Clock className="w-3.5 h-3.5 text-cyan-600 dark:text-cyan-400" />
-                    <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">时间线追踪</h4>
-                  </div>
-                  <div className="p-4">
-                    <TimelineStep
-                      label="创建"
-                      time={selectedLog.createdAt}
-                      isActive={!!selectedLog.createdAt}
-                      isLast={false}
-                      color="bg-slate-400"
-                    />
-                    <TimelineStep
-                      label="发送"
-                      time={selectedLog.sentAt}
-                      isActive={!!selectedLog.sentAt}
-                      isLast={false}
-                      color="bg-blue-500"
-                    />
-                    <TimelineStep
-                      label="送达"
-                      time={selectedLog.deliveredAt}
-                      isActive={!!selectedLog.deliveredAt}
-                      isLast={!selectedLog.openedAt && !selectedLog.repliedAt && !selectedLog.bouncedAt}
-                      color="bg-indigo-500"
-                    />
-                    <TimelineStep
-                      label="打开"
-                      time={selectedLog.openedAt}
-                      isActive={!!selectedLog.openedAt}
-                      isLast={!selectedLog.repliedAt && !selectedLog.bouncedAt}
-                      color="bg-emerald-500"
-                    />
-                    <TimelineStep
-                      label="回复 ✨"
-                      time={selectedLog.repliedAt}
-                      isActive={!!selectedLog.repliedAt}
-                      isLast={!selectedLog.error && !selectedLog.bouncedAt}
-                      color="bg-green-500"
-                    />
-                    {selectedLog.error && (
-                      <div className="mt-3 rounded-xl bg-red-50 dark:bg-red-950/30 p-3 border border-red-200/50 dark:border-red-900/30">
-                        <p className="text-xs font-semibold text-red-600 dark:text-red-400 mb-1">⚠️ 错误信息</p>
-                        <p className="text-xs text-red-700 dark:text-red-300">{selectedLog.error}</p>
-                      </div>
-                    )}
-                    {selectedLog.bouncedAt && (
-                      <TimelineStep
-                        label="退信 ❌"
-                        time={selectedLog.bouncedAt}
-                        isActive={true}
-                        isLast={true}
-                        color="bg-red-500"
-                      />
-                    )}
-                  </div>
-                </div>
-              </div>
-            </>
-          )}
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }
+
+

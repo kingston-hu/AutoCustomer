@@ -48,7 +48,11 @@ interface MailLogItem {
   developerUsername: string | null;
   githubUrl: string | null;
   senderEmail: string | null;
+  batchId?: string | null;
+  runId?: string | null;
+  reasonCode?: string | null;
 }
+
 
 const STATUS_OPTIONS = [
   { value: "all", label: "全部状态" },
@@ -70,6 +74,43 @@ const QUICK_FILTER_OPTIONS = [
   { value: "today", label: "仅看今天" },
 ];
 
+const REASON_CODE_OPTIONS = [
+  { value: "all", label: "全部原因码" },
+  { value: "SENT", label: "SENT" },
+  { value: "FAILED_SEND", label: "FAILED_SEND" },
+  { value: "FAILED_AI_GENERATION", label: "FAILED_AI_GENERATION" },
+  { value: "SKIPPED_NO_EMAIL", label: "SKIPPED_NO_EMAIL" },
+  { value: "SKIPPED_INVALID_EMAIL", label: "SKIPPED_INVALID_EMAIL" },
+  { value: "SKIPPED_ALREADY_SENT", label: "SKIPPED_ALREADY_SENT" },
+  { value: "SKIPPED_NOT_SELECTED", label: "SKIPPED_NOT_SELECTED" },
+  { value: "SKIPPED_DUPLICATE_EMAIL", label: "SKIPPED_DUPLICATE_EMAIL" },
+  { value: "GENERATED_DRY_RUN", label: "GENERATED_DRY_RUN" },
+];
+
+const reasonCodeBadgeMap: Record<string, string> = {
+  SENT: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300 border-emerald-200/60 dark:border-emerald-800/40",
+  FAILED_SEND: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300 border-red-200/60 dark:border-red-800/40",
+  FAILED_AI_GENERATION: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300 border-red-200/60 dark:border-red-800/40",
+  SKIPPED_NO_EMAIL: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 border-amber-200/60 dark:border-amber-800/40",
+  SKIPPED_INVALID_EMAIL: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 border-amber-200/60 dark:border-amber-800/40",
+  SKIPPED_ALREADY_SENT: "bg-slate-100 text-slate-700 dark:bg-slate-900/40 dark:text-slate-300 border-slate-200/60 dark:border-slate-800/40",
+  SKIPPED_NOT_SELECTED: "bg-slate-100 text-slate-700 dark:bg-slate-900/40 dark:text-slate-300 border-slate-200/60 dark:border-slate-800/40",
+  SKIPPED_DUPLICATE_EMAIL: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 border-amber-200/60 dark:border-amber-800/40",
+  GENERATED_DRY_RUN: "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 border-blue-200/60 dark:border-blue-800/40",
+};
+
+const reasonCodeLabelMap: Record<string, string> = {
+  SENT: "发送成功",
+  FAILED_SEND: "发送失败",
+  FAILED_AI_GENERATION: "AI 生成失败",
+  SKIPPED_NO_EMAIL: "无邮箱",
+  SKIPPED_INVALID_EMAIL: "邮箱无效",
+  SKIPPED_ALREADY_SENT: "已发送过",
+  SKIPPED_NOT_SELECTED: "未被选中",
+  SKIPPED_DUPLICATE_EMAIL: "重复邮箱",
+  GENERATED_DRY_RUN: "仅生成未发送",
+};
+
 const statusMeta: Record<string, { label: string; className: string; icon: React.ReactNode }> = {
   SENT: { label: "成功", className: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300", icon: <CheckCircle2 className="w-3.5 h-3.5" /> },
   DELIVERED: { label: "已送达", className: "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300", icon: <Send className="w-3.5 h-3.5" /> },
@@ -77,6 +118,7 @@ const statusMeta: Record<string, { label: string; className: string; icon: React
   FAILED: { label: "失败", className: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300", icon: <AlertCircle className="w-3.5 h-3.5" /> },
   BOUNCED: { label: "退信", className: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300", icon: <AlertCircle className="w-3.5 h-3.5" /> },
 };
+
 
 function formatTime(value?: string | null) {
   if (!value) return "-";
@@ -108,6 +150,9 @@ export default function MailLogsPage() {
   const [quickFilter, setQuickFilter] = useState("all");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+  const [batchIdFilter, setBatchIdFilter] = useState("");
+  const [runIdFilter, setRunIdFilter] = useState("");
+  const [reasonCodeFilter, setReasonCodeFilter] = useState("all");
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
 
@@ -123,9 +168,12 @@ export default function MailLogsPage() {
     if (quickFilter !== "all") params.set("quickFilter", quickFilter);
     if (startDate) params.set("startDate", startDate);
     if (endDate) params.set("endDate", endDate);
+    if (batchIdFilter.trim()) params.set("batchId", batchIdFilter.trim());
+    if (runIdFilter.trim()) params.set("runId", runIdFilter.trim());
+    if (reasonCodeFilter !== "all") params.set("reasonCode", reasonCodeFilter);
     if (forExport) params.set("export", "csv");
     return params;
-  }, [page, search, statusFilter, senderFilter, quickFilter, startDate, endDate]);
+  }, [page, search, statusFilter, senderFilter, quickFilter, startDate, endDate, batchIdFilter, runIdFilter, reasonCodeFilter]);
 
   const fetchLogs = useCallback(async () => {
     setLoading(true);
@@ -173,6 +221,9 @@ export default function MailLogsPage() {
     setQuickFilter("all");
     setStartDate("");
     setEndDate("");
+    setBatchIdFilter("");
+    setRunIdFilter("");
+    setReasonCodeFilter("all");
   };
 
   const applyTodayFilter = () => {
@@ -187,6 +238,7 @@ export default function MailLogsPage() {
     const url = `/api/outreach?${buildParams(true).toString()}`;
     window.open(url, "_blank");
   };
+
 
   return (
     <div className="space-y-6">
@@ -271,9 +323,30 @@ export default function MailLogsPage() {
             </Select>
           </div>
 
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[220px_220px_auto_auto_auto]">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[220px_220px_220px_220px_220px]">
+            <Input
+              value={batchIdFilter}
+              onChange={(e) => { setPage(1); setBatchIdFilter(e.target.value); }}
+              placeholder="按 batchId 过滤"
+              className="rounded-xl"
+            />
+            <Input
+              value={runIdFilter}
+              onChange={(e) => { setPage(1); setRunIdFilter(e.target.value); }}
+              placeholder="按 runId 过滤"
+              className="rounded-xl"
+            />
+            <Select value={reasonCodeFilter} onValueChange={(value) => { setPage(1); setReasonCodeFilter(value || "all"); }}>
+              <SelectTrigger className="rounded-xl"><SelectValue placeholder="原因码" /></SelectTrigger>
+              <SelectContent>
+                {REASON_CODE_OPTIONS.map((item) => <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>)}
+              </SelectContent>
+            </Select>
             <Input type="date" value={startDate} onChange={(e) => { setPage(1); setStartDate(e.target.value); }} className="rounded-xl" />
             <Input type="date" value={endDate} onChange={(e) => { setPage(1); setEndDate(e.target.value); }} className="rounded-xl" />
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[auto_auto_auto]">
             <Button className="rounded-xl bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white hover:from-violet-700 hover:to-fuchsia-700" onClick={runSearch}>查询</Button>
             <Button variant="outline" className="rounded-xl" onClick={() => { setPage(1); setQuickFilter("failed"); }}>仅看失败</Button>
             <Button variant="outline" className="rounded-xl" onClick={applyTodayFilter}>仅看今天</Button>
@@ -292,16 +365,19 @@ export default function MailLogsPage() {
                   <TableHead className="min-w-[160px]">发信邮箱</TableHead>
                   <TableHead className="min-w-[220px]">开发者邮箱</TableHead>
                   <TableHead className="min-w-[160px]">GitHub 主页</TableHead>
+                  <TableHead className="min-w-[180px]">批次 / 运行</TableHead>
+                  <TableHead className="min-w-[180px]">原因码</TableHead>
                   <TableHead className="min-w-[320px]">发信内容</TableHead>
                   <TableHead className="min-w-[120px]">发送状态</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {loading ? (
-                  <TableRow><TableCell colSpan={6} className="h-32 text-center text-muted-foreground">正在加载发信记录...</TableCell></TableRow>
+                  <TableRow><TableCell colSpan={8} className="h-32 text-center text-muted-foreground">正在加载发信记录...</TableCell></TableRow>
                 ) : logs.length === 0 ? (
-                  <TableRow><TableCell colSpan={6} className="h-32 text-center text-muted-foreground">没有找到符合条件的发信记录</TableCell></TableRow>
+                  <TableRow><TableCell colSpan={8} className="h-32 text-center text-muted-foreground">没有找到符合条件的发信记录</TableCell></TableRow>
                 ) : (
+
                   logs.map((log) => {
                     const meta = statusMeta[log.status] || statusMeta.FAILED;
                     const senderLabel = detectSenderLabel(log.senderEmail);
@@ -332,7 +408,22 @@ export default function MailLogsPage() {
                           )}
                         </TableCell>
                         <TableCell>
-                          <div className="space-y-1 max-w-[420px]">
+                          <div className="space-y-1 text-xs">
+                            <div><span className="text-muted-foreground">batch：</span><span className="font-mono break-all">{log.batchId || "-"}</span></div>
+                            <div><span className="text-muted-foreground">run：</span><span className="font-mono break-all">{log.runId || "-"}</span></div>
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          {log.reasonCode ? (
+                            <Badge variant="outline" className={`rounded-full text-[11px] font-mono ${reasonCodeBadgeMap[log.reasonCode] || ""}`} title={log.reasonCode}>{reasonCodeLabelMap[log.reasonCode] || log.reasonCode}</Badge>
+
+
+                          ) : (
+                            <span className="text-sm text-muted-foreground">-</span>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          <div className="space-y-2">
                             <div className="font-medium line-clamp-1">{log.subject || "(无主题)"}</div>
                             <div className="text-sm text-muted-foreground line-clamp-3 whitespace-pre-wrap">{log.body || "-"}</div>
                             {log.error ? <div className="text-xs text-red-500 line-clamp-2">失败原因：{log.error}</div> : null}

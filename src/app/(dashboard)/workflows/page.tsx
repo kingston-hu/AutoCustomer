@@ -115,21 +115,35 @@ const STEP_TYPES = [
 ];
 
 type AutoOutreachStatus = {
-  status: "idle" | "running" | "paused" | "completed";
+  status: "idle" | "queued" | "running" | "paused" | "completed" | "failed";
   runId?: string;
+  taskId?: string;
+  batchId?: string | null;
   startedAt?: string | null;
   finishedAt?: string | null;
   durationMs?: number;
   progress?: { done: number; total: number; succeeded: number; failed: number; skipped: number };
   controls?: { paused: boolean; stopRequested: boolean; canPause: boolean; canResume: boolean; canStop: boolean };
+  items?: Array<{
+    id: string;
+    targetId: string;
+    email?: string | null;
+    status: string;
+    reasonCode?: string | null;
+    subject?: string | null;
+    error?: string | null;
+    createdAt?: string;
+    meta?: any;
+  }>;
   history?: Array<{
     id: string;
-    startedAt: string;
+    startedAt: string | null;
     finishedAt: string | null;
-    status: "running" | "completed" | "failed";
+    status: "queued" | "running" | "completed" | "failed";
     durationMs: number | null;
     progress: { done: number; total: number; succeeded: number; failed: number; skipped: number };
     summary: string;
+    batchId?: string | null;
   }>;
 };
 
@@ -245,22 +259,46 @@ export default function WorkflowsPage() {
   const [developerSearch, setDeveloperSearch] = useState("");
   const [selectingAllResults, setSelectingAllResults] = useState(false);
   const [developerTotalCount, setDeveloperTotalCount] = useState(0);
+  const [developerPickerPage, setDeveloperPickerPage] = useState(1);
+  const [developerPickerTotalPages, setDeveloperPickerTotalPages] = useState(1);
+  const [developerPickerPageInput, setDeveloperPickerPageInput] = useState("1");
+  const [developerPickerLoading, setDeveloperPickerLoading] = useState(false);
+  const developerPickerPageSize = 50;
 
 
 
 
-  const loadDeveloperOptions = useCallback(async () => {
+
+  const loadDeveloperOptions = useCallback(async (page = developerPickerPage, searchValue = developerSearch) => {
     try {
-      const params = new URLSearchParams({ page: "1", pageSize: "100", ...(developerSearch && { search: developerSearch }) });
+      setDeveloperPickerLoading(true);
+      const safePage = Math.max(1, page || 1);
+      const params = new URLSearchParams({
+        page: String(safePage),
+        pageSize: String(developerPickerPageSize),
+        ...(searchValue && { search: searchValue }),
+      });
       const res = await fetch(`/api/developers?${params}`, { cache: "no-store" });
       if (!res.ok) return;
       const data = await res.json();
+      const pagination = data.pagination || {};
       setDeveloperOptions(data.data || []);
-      setDeveloperTotalCount(data.pagination?.total || 0);
+      setDeveloperTotalCount(pagination.total || 0);
+      setDeveloperPickerPage(pagination.page || safePage);
+      setDeveloperPickerTotalPages(pagination.totalPages || 1);
+      setDeveloperPickerPageInput(String(pagination.page || safePage));
     } catch {
       // ignore developer picker load errors
+    } finally {
+      setDeveloperPickerLoading(false);
     }
-  }, [developerSearch]);
+  }, [developerPickerPage, developerSearch]);
+
+  const jumpToDeveloperPickerPage = async (rawPage: string | number) => {
+    const targetPage = Math.max(1, Math.min(developerPickerTotalPages, Number(rawPage) || 1));
+    await loadDeveloperOptions(targetPage, developerSearch);
+  };
+
 
   const selectAllMatchingDevelopers = async () => {
     try {
@@ -298,12 +336,22 @@ export default function WorkflowsPage() {
   };
 
   const selectAllVisibleDevelopers = () => {
-    setSelectedDeveloperIds(new Set(developerOptions.map((d: any) => d.id)));
+    setSelectedDeveloperIds((prev) => {
+      const next = new Set(prev);
+      developerOptions.forEach((d: any) => d?.id && next.add(d.id));
+      return next;
+    });
   };
 
   const clearSelectedDevelopers = () => {
     setSelectedDeveloperIds(new Set());
   };
+
+  useEffect(() => {
+    if (!developerPickerOpen) return;
+    loadDeveloperOptions(developerPickerPage, developerSearch);
+  }, [developerPickerOpen]);
+
 
   const loadAutoOutreachStatus = useCallback(async () => {
     try {
@@ -431,8 +479,11 @@ export default function WorkflowsPage() {
         });
 
         if (res.ok) {
-          alert(`已启动！\n\n通道：${is163FixedWorkflow ? "163" : "Zoho"}\n主题：${payload.fixedSubject}\n发送间隔：${getDelaySeconds(is163)} 秒\n目标：${selectedIds.length > 0 ? `已选 ${selectedIds.length} 位开发者` : "所有未成功发送的候选人"}`);
+          const data = await res.json().catch(() => ({}));
+          alert(`已提交任务！\n\n状态：${data.status || "queued"}\n任务ID：${data.taskId || "--"}\n通道：${is163FixedWorkflow ? "163" : "Zoho"}\n主题：${payload.fixedSubject}\n发送间隔：${getDelaySeconds(is163)} 秒\n目标：${selectedIds.length > 0 ? `已选 ${selectedIds.length} 位开发者` : "所有未成功发送的候选人"}`);
+          await loadAutoOutreachStatus();
         } else {
+
           const err = await res.json().catch(() => ({}));
           alert(`启动失败: ${err.error || res.statusText}`);
         }
@@ -721,6 +772,9 @@ export default function WorkflowsPage() {
             const runtimeProgress = isFixedOutreachWorkflow ? runtimeSource?.progress ?? null : null;
             const runtimeDurationMs = isFixedOutreachWorkflow ? runtimeSource?.durationMs ?? null : null;
             const runtimeHistory = isFixedOutreachWorkflow ? runtimeSource?.history ?? [] : [];
+            const runtimeResults = isFixedOutreachWorkflow ? runtimeSource?.results ?? [] : [];
+            const runtimeItems = isFixedOutreachWorkflow ? runtimeSource?.items ?? [] : [];
+
 
             return (
 
@@ -761,14 +815,29 @@ export default function WorkflowsPage() {
                             <Badge className={`gap-1 text-[11px] font-medium border-transparent ${
                               runtimeStatus === "running"
                                 ? "bg-emerald-100/80 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400"
-                                : runtimeStatus === "completed"
-                                  ? "bg-blue-100/80 dark:bg-blue-900/40 text-blue-700 dark:text-blue-400"
-                                  : "bg-slate-100/80 dark:bg-slate-900/40 text-slate-700 dark:text-slate-400"
+                                : runtimeStatus === "queued"
+                                  ? "bg-amber-100/80 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400"
+                                  : runtimeStatus === "completed"
+                                    ? "bg-blue-100/80 dark:bg-blue-900/40 text-blue-700 dark:text-blue-400"
+                                    : runtimeStatus === "failed"
+                                      ? "bg-red-100/80 dark:bg-red-900/40 text-red-700 dark:text-red-400"
+                                      : "bg-slate-100/80 dark:bg-slate-900/40 text-slate-700 dark:text-slate-400"
                             }`}>
                               <Activity className="w-3 h-3" />
-                              {runtimeStatus === "running" ? "运行中" : runtimeStatus === "paused" ? "已暂停" : runtimeStatus === "completed" ? "最近已完成" : "空闲"}
+                              {runtimeStatus === "running"
+                                ? "运行中"
+                                : runtimeStatus === "queued"
+                                  ? "排队中"
+                                  : runtimeStatus === "paused"
+                                    ? "已暂停"
+                                    : runtimeStatus === "completed"
+                                      ? "最近已完成"
+                                      : runtimeStatus === "failed"
+                                        ? "执行失败"
+                                        : "空闲"}
                             </Badge>
                           ) : workflow.enabled && (
+
                             <Badge className="gap-1 text-[11px] font-medium bg-emerald-100/80 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400 border-transparent">
                               <Activity className="w-3 h-3" /> 运行中
                             </Badge>
@@ -828,7 +897,8 @@ export default function WorkflowsPage() {
                         size="sm"
                         variant="ghost"
                         className="h-8 text-xs hover:bg-emerald-50 dark:hover:bg-emerald-950/30 rounded-lg"
-                        disabled={!workflow.enabled || (isFixedOutreachWorkflow && runtimeStatus === "running")}
+                        disabled={!workflow.enabled || (isFixedOutreachWorkflow && ["queued", "running", "paused"].includes(runtimeStatus))}
+
                         onClick={(e) => { e.stopPropagation(); runWorkflow(workflow.id); }}
                       >
                         <Play className="w-3.5 h-3.5 mr-1" /> 运行
@@ -894,20 +964,22 @@ export default function WorkflowsPage() {
                               className="h-9 text-sm"
                             />
                           </div>
-                          <Dialog open={developerPickerOpen} onOpenChange={(open) => { setDeveloperPickerOpen(open); if (open) loadDeveloperOptions(); }}>
-                            <DialogTrigger>
-                              <Button variant="outline" className="gap-2 h-9 text-sm whitespace-nowrap border-blue-300/50 hover:bg-blue-50 dark:hover:bg-blue-950/20">
-                                <Users className="w-4 h-4" />
-                                选择开发者
-                                {selectedDeveloperIds.size > 0 && (
-                                  <Badge variant="secondary" className="ml-0.5 h-5 px-1.5 text-[11px] tabular-nums">{selectedDeveloperIds.size}</Badge>
-                                )}
-                              </Button>
-                            </DialogTrigger>
+                          <Dialog open={developerPickerOpen} onOpenChange={(open) => { setDeveloperPickerOpen(open); if (open) { setDeveloperPickerPage(1); setDeveloperPickerPageInput("1"); loadDeveloperOptions(1, developerSearch); } }}>
+                            <DialogTrigger
+                              render={
+                                <Button variant="outline" className="gap-2 h-9 text-sm whitespace-nowrap border-blue-300/50 hover:bg-blue-50 dark:hover:bg-blue-950/20">
+                                  <Users className="w-4 h-4" />
+                                  选择开发者
+                                  {selectedDeveloperIds.size > 0 && (
+                                    <Badge variant="secondary" className="ml-0.5 h-5 px-1.5 text-[11px] tabular-nums">{selectedDeveloperIds.size}</Badge>
+                                  )}
+                                </Button>
+                              }
+                            />
                             <DialogContent className="sm:max-w-[640px] max-h-[80vh] overflow-y-auto">
                               <DialogHeader>
                                 <DialogTitle>选择开发者</DialogTitle>
-                                <DialogDescription>勾选要发送的开发者。当前列表接口单页最多返回 50 条；可使用“全选全部结果”跨页选中全部搜索结果。</DialogDescription>
+                                <DialogDescription>勾选要发送的开发者。当前列表支持分页浏览、页码输入跳转，也可使用“全选全部结果”跨页选中全部搜索结果。</DialogDescription>
                               </DialogHeader>
 
                               <div className="space-y-3">
@@ -916,10 +988,27 @@ export default function WorkflowsPage() {
                                   <Input
                                     value={developerSearch}
                                     onChange={(e) => setDeveloperSearch(e.target.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter") {
+                                        setDeveloperPickerPage(1);
+                                        setDeveloperPickerPageInput("1");
+                                        loadDeveloperOptions(1, developerSearch.trim());
+                                      }
+                                    }}
                                     placeholder="搜索用户名 / 显示名 / 邮箱..."
                                     className="h-8 text-sm flex-1 min-w-[220px]"
                                   />
-                                  <Button size="sm" variant="outline" onClick={() => loadDeveloperOptions()} className="shrink-0 gap-1 h-8">
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => {
+                                      setDeveloperPickerPage(1);
+                                      setDeveloperPickerPageInput("1");
+                                      loadDeveloperOptions(1, developerSearch.trim());
+                                    }}
+                                    className="shrink-0 gap-1 h-8"
+                                    disabled={developerPickerLoading}
+                                  >
                                     <Search className="w-3 h-3" /> 搜索
                                   </Button>
                                   <Button size="sm" variant="outline" onClick={selectAllVisibleDevelopers} className="shrink-0 gap-1 h-8">
@@ -928,15 +1017,77 @@ export default function WorkflowsPage() {
                                   <Button size="sm" variant="outline" onClick={selectAllMatchingDevelopers} disabled={selectingAllResults} className="shrink-0 gap-1 h-8">
                                     {selectingAllResults ? "全选中..." : `全选全部结果（${developerTotalCount}）`}
                                   </Button>
-                                  <Button size="sm" variant="outline" onClick={clearSelectedDevelopers} className="shrink-0 gap-1 h-8">
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => {
+                                      setDeveloperSearch("");
+                                      setDeveloperPickerPage(1);
+                                      setDeveloperPickerPageInput("1");
+                                      loadDeveloperOptions(1, "");
+                                    }}
+                                    className="shrink-0 gap-1 h-8"
+                                  >
                                     清空
                                   </Button>
                                 </div>
 
+                                {/* Pagination Controls */}
+                                <div className="flex items-center justify-between gap-2 flex-wrap rounded-xl border border-border/50 bg-muted/20 px-3 py-2">
+                                  <span className="text-xs text-muted-foreground">
+                                    第 <strong>{developerPickerPage}</strong> / <strong>{developerPickerTotalPages}</strong> 页，共 <strong>{developerTotalCount}</strong> 位开发者
+                                  </span>
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <Button
+                                      size="sm"
+                                      variant="outline"
+                                      className="h-8 px-2.5"
+                                      disabled={developerPickerLoading || developerPickerPage <= 1}
+                                      onClick={() => jumpToDeveloperPickerPage(developerPickerPage - 1)}
+                                    >
+                                      上一页
+                                    </Button>
+                                    <div className="flex items-center gap-1 text-xs">
+                                      <span className="text-muted-foreground">跳到</span>
+                                      <Input
+                                        value={developerPickerPageInput}
+                                        onChange={(e) => setDeveloperPickerPageInput(e.target.value.replace(/[^0-9]/g, ""))}
+                                        onKeyDown={(e) => {
+                                          if (e.key === "Enter") {
+                                            jumpToDeveloperPickerPage(developerPickerPageInput);
+                                          }
+                                        }}
+                                        className="h-8 w-16 text-center"
+                                      />
+                                      <span className="text-muted-foreground">页</span>
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        className="h-8 px-2.5"
+                                        disabled={developerPickerLoading}
+                                        onClick={() => jumpToDeveloperPickerPage(developerPickerPageInput)}
+                                      >
+                                        确定
+                                      </Button>
+                                    </div>
+                                    <Button
+                                      size="sm"
+                                      variant="outline"
+                                      className="h-8 px-2.5"
+                                      disabled={developerPickerLoading || developerPickerPage >= developerPickerTotalPages}
+                                      onClick={() => jumpToDeveloperPickerPage(developerPickerPage + 1)}
+                                    >
+                                      下一页
+                                    </Button>
+                                  </div>
+                                </div>
+
                                 {/* Developer List */}
                                 <div className="rounded-xl border border-border/60 max-h-[320px] overflow-y-auto divide-y divide-border/40">
-                                  {developerOptions.length === 0 ? (
-                                    <div className="p-6 text-center text-sm text-muted-foreground">暂无开发者数据，请尝试搜索或刷新</div>
+                                  {developerPickerLoading ? (
+                                    <div className="p-6 text-center text-sm text-muted-foreground">正在加载开发者列表...</div>
+                                  ) : developerOptions.length === 0 ? (
+                                    <div className="p-6 text-center text-sm text-muted-foreground">当前页没有开发者数据，请尝试搜索或切换页码</div>
                                   ) : developerOptions.map((dev: any) => {
                                     const isSelected = selectedDeveloperIds.has(dev.id);
                                     return (
@@ -974,14 +1125,15 @@ export default function WorkflowsPage() {
                                 </div>
 
                                 {/* Footer Summary */}
-                                <div className="flex items-center justify-between pt-1 border-t border-border/40">
+                                <div className="flex items-center justify-between pt-1 border-t border-border/40 gap-2 flex-wrap">
                                   <span className="text-xs text-muted-foreground">
-                                    当前页加载 {developerOptions.length} 位开发者，已选择 <strong>{selectedDeveloperIds.size}</strong> 位
+                                    当前页加载 {developerOptions.length} 位开发者（第 {developerPickerPage}/{developerPickerTotalPages} 页），已选择 <strong>{selectedDeveloperIds.size}</strong> 位
                                   </span>
                                   <Button size="sm" onClick={() => setDeveloperPickerOpen(false)}>确认选择</Button>
                                 </div>
                               </div>
                             </DialogContent>
+
                           </Dialog>
                         </div>
                       </div>
@@ -995,10 +1147,18 @@ export default function WorkflowsPage() {
                             <h4 className="text-sm font-semibold flex items-center gap-2">
                               <Activity className="w-4 h-4 text-amber-500" /> 当前运行状态
                             </h4>
-                            <p className="text-xs text-muted-foreground mt-1">实时轮询 /api/automation/auto-outreach</p>
+                            <p className="text-xs text-muted-foreground mt-1">
+                              {runtimeSource?.taskId ? "状态来自 Worker / task_queue 持久化结果" : "实时轮询 /api/automation/auto-outreach"}
+                            </p>
                           </div>
                           <div className="flex items-center gap-2 flex-wrap">
-                            <Badge variant="outline">状态：{runtimeStatus === "running" ? "运行中" : runtimeStatus === "paused" ? "已暂停" : runtimeStatus === "completed" ? "已完成" : "空闲"}</Badge>
+                            <Badge variant="outline">状态：{runtimeStatus === "running" ? "运行中" : runtimeStatus === "queued" ? "排队中" : runtimeStatus === "paused" ? "已暂停" : runtimeStatus === "completed" ? "已完成" : runtimeStatus === "failed" ? "失败" : "空闲"}</Badge>
+                            {(runtimeSource?.taskId || runtimeSource?.runId) && (
+                              <Badge variant="outline">任务：{runtimeSource?.taskId || runtimeSource?.runId}</Badge>
+                            )}
+                            {runtimeSource?.batchId && (
+                              <Badge variant="outline">批次：{runtimeSource.batchId}</Badge>
+                            )}
                             <Badge variant="outline">本次运行时长：{formatDuration(runtimeDurationMs)}</Badge>
                           </div>
                         </div>
@@ -1033,6 +1193,65 @@ export default function WorkflowsPage() {
                           </div>
                         </div>
 
+                        {runtimeStatus === "idle" && runtimeHistory.length === 0 && (
+                          <div className="rounded-xl border border-dashed border-border/60 bg-background/40 p-4 text-sm text-muted-foreground">
+                            当前没有运行中的自动化任务。点击上方“运行”后，页面会显示 taskId、批次ID、执行进度与最近结果。
+                          </div>
+                        )}
+
+                        {runtimeStatus === "queued" && (
+                          <div className="rounded-xl border border-blue-200/60 dark:border-blue-800/40 bg-blue-50/60 dark:bg-blue-950/10 p-4 text-sm text-blue-900 dark:text-blue-200">
+                            任务已经入队，正在等待 Worker 抢占执行。你现在可以离开页面，稍后回来仍能看到状态。
+                          </div>
+                        )}
+
+                        {runtimeStatus === "failed" && (
+                          <div className="rounded-xl border border-red-200/60 dark:border-red-800/40 bg-red-50/60 dark:bg-red-950/10 p-4 space-y-2">
+                            <p className="text-sm font-medium text-red-900 dark:text-red-200">最近一次任务执行失败</p>
+                            <p className="text-xs text-red-800/80 dark:text-red-300/80">
+                              {runtimeHistory[0]?.summary || "Worker 执行过程中出现异常，请查看最近结果或运行日志。"}
+                            </p>
+                          </div>
+                        )}
+
+                        {(runtimeItems.length > 0 || runtimeResults.length > 0) && (
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <h5 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">最近执行结果</h5>
+                              <span className="text-[11px] text-muted-foreground">最近 {Math.min(runtimeItems.length > 0 ? runtimeItems.length : runtimeResults.length, 5)} 条</span>
+                            </div>
+                            <div className="space-y-2">
+                              {runtimeItems.length > 0 ? runtimeItems.slice(0, 5).map((item, idx) => (
+                                <div key={`${item.id}-${idx}`} className="rounded-xl border border-border/60 bg-background/70 p-3 flex flex-col gap-2">
+                                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <Badge variant="outline">{item.status === "sent" ? "已发送" : item.status === "failed" ? "失败" : item.status === "skipped" ? "跳过" : item.status === "generated" ? "已生成" : item.status}</Badge>
+                                      <span className="text-xs font-medium">{item.meta?.name || item.meta?.username || item.targetId}</span>
+                                    </div>
+                                    {item.email && <span className="text-[11px] text-muted-foreground font-mono">{item.email}</span>}
+                                  </div>
+                                  {item.reasonCode && <div className="text-[11px] text-amber-700 dark:text-amber-300">原因码：{item.reasonCode}</div>}
+                                  {item.subject && <div className="text-xs text-muted-foreground">主题：{item.subject}</div>}
+                                  {item.error && <div className="text-xs text-red-600">错误：{item.error}</div>}
+                                </div>
+                              )) : runtimeResults.slice(0, 5).map((item, idx) => (
+                                <div key={`${item.id}-${idx}`} className="rounded-xl border border-border/60 bg-background/70 p-3 flex flex-col gap-2">
+                                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <Badge variant="outline">{item.stage === "sent" ? "已发送" : item.stage === "failed" ? "失败" : item.stage === "skipped" ? "跳过" : item.stage === "generated" ? "已生成" : item.stage}</Badge>
+                                      <span className="text-xs font-medium">{item.name || item.username || item.id}</span>
+                                    </div>
+                                    {item.email && <span className="text-[11px] text-muted-foreground font-mono">{item.email}</span>}
+                                  </div>
+                                  {item.subject && <div className="text-xs text-muted-foreground">主题：{item.subject}</div>}
+                                  {item.bodyPreview && <div className="text-xs text-muted-foreground">预览：{item.bodyPreview}</div>}
+                                  {item.error && <div className="text-xs text-red-600">错误：{item.error}</div>}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
                         <div className="space-y-2">
                           <div className="flex items-center justify-between">
                             <h5 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">历史运行记录</h5>
@@ -1046,13 +1265,14 @@ export default function WorkflowsPage() {
                                 <div key={item.id} className="rounded-xl border border-border/60 bg-background/70 p-3 flex flex-col gap-2">
                                   <div className="flex items-center justify-between gap-3 flex-wrap">
                                     <div className="flex items-center gap-2 flex-wrap">
-                                      <Badge variant="outline">{item.status === "running" ? "运行中" : item.status === "failed" ? "失败" : "已完成"}</Badge>
+                                      <Badge variant="outline">{item.status === "running" ? "运行中" : item.status === "queued" ? "排队中" : item.status === "failed" ? "失败" : item.status === "paused" ? "已暂停" : "已完成"}</Badge>
                                       <span className="text-xs text-muted-foreground font-mono">{new Date(item.startedAt).toLocaleString("zh-CN")}</span>
+                                      {item.batchId && <Badge variant="secondary" className="text-[10px]">{item.batchId}</Badge>}
                                     </div>
                                     <span className="text-xs text-muted-foreground">本次运行时长：{formatDuration(item.durationMs)}</span>
                                   </div>
                                   <div className="text-sm font-medium">
-                                    本次发送 {item.progress.done} 封邮件
+                                    本次处理 {item.progress.done} 项任务
                                   </div>
                                   <div className="text-[11px] text-muted-foreground tabular-nums">
                                     成功 {item.progress.succeeded} · 失败 {item.progress.failed} · 跳过 {item.progress.skipped} · 总任务数 {item.progress.total}

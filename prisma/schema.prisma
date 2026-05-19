@@ -239,17 +239,58 @@ model workflow_definitions {
 model workflow_runs {
   id                   String               @id
   workflow_id          String
+  task_id              String?
+  workflow_key         String?
+  batch_id             String?
   campaign_id          String?
   status               String               @default("PENDING")
   current_step         String?
+  progress_done        Int                  @default(0)
+  progress_total       Int                  @default(0)
+  progress_succeeded   Int                  @default(0)
+  progress_failed      Int                  @default(0)
+  progress_skipped     Int                  @default(0)
+  current_target_id    String?
   context              Json?
   result               Json?
   error                String?
   logs                 Json?
   started_at           DateTime?
   completed_at         DateTime?
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @default(now())
   campaigns            campaigns?           @relation(fields: [campaign_id], references: [id])
   workflow_definitions workflow_definitions @relation(fields: [workflow_id], references: [id])
+  workflow_run_items   workflow_run_items[]
 
   @@index([status])
+  @@index([workflow_key, createdAt])
+  @@index([task_id])
+  @@index([batch_id])
 }
+
+model workflow_run_items {
+  id            String        @id
+  run_id        String
+  task_id       String?
+  workflow_key  String?
+  batch_id      String?
+  target_type   String
+  target_id     String
+  email         String?
+  status        String
+  reason_code   String?
+  subject       String?
+  error         String?
+  meta          Json?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime
+  workflow_runs workflow_runs @relation(fields: [run_id], references: [id])
+
+  @@index([run_id, createdAt])
+  @@index([task_id])
+  @@index([batch_id])
+  @@index([status, reason_code])
+  @@index([target_type, target_id])
+}
+

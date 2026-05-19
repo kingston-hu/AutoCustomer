@@ -17,7 +17,11 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { sendEmail } from "@/services/email/service";
+import { createAutoOutreachJob, normalizeAutoOutreachJobInput } from "@/services/automation/auto-outreach/create-job";
+import { executeAutoOutreachJob } from "@/services/automation/auto-outreach/executor";
+import { ensureWorkflowRun } from "@/services/automation/workflow-runs";
+
+
 import { Channel, SendStatus, TargetType } from "@/lib/constants";
 import {
   outreachMessagePrompt,
@@ -390,62 +394,276 @@ function rebuildStatusFromDB(workflowKey: WorkflowKey): {
   }
 }
 
-export async function GET(request: NextRequest) {
-  const workflowKey = getWorkflowKey(new URL(request.url).searchParams.get("workflowKey") || undefined);
-  let runStatus = getRunStatus(workflowKey);
-  let runHistory = getRunHistory(workflowKey);
 
-  // 内存无状态时，尝试从数据库回填（解决服务重启后页面空白的问题）
-  if (!runStatus && runHistory.length === 0) {
-    const dbData = await rebuildStatusFromDB(workflowKey);
-    if (dbData.status) {
-      runStatus = dbData.status;
-      runHistory = dbData.history;
+async function getLatestTaskRuntime(workflowKey: WorkflowKey) {
+  const latestTask = await db.task_queue.findFirst({
+    where: {
+      type: "AUTO_OUTREACH",
+      payload: {
+        path: "workflowKey",
+        equals: workflowKey,
+      } as any,
+    },
+    orderBy: [
+      { completed_at: "desc" },
+      { started_at: "desc" },
+      { createdAt: "desc" },
+    ],
+  });
+
+  if (!latestTask) return null;
+
+  const result = latestTask.result && typeof latestTask.result === "object"
+    ? (latestTask.result as Record<string, any>)
+    : {};
+
+  const progress = {
+    done: Number(result?.progress?.done ?? 0),
+    total: Number(result?.progress?.total ?? 0),
+    succeeded: Number(result?.progress?.succeeded ?? 0),
+    failed: Number(result?.progress?.failed ?? 0),
+    skipped: Number(result?.progress?.skipped ?? 0),
+  };
+
+  const startedAt = latestTask.started_at ?? latestTask.createdAt ?? null;
+  const finishedAt = latestTask.completed_at ?? null;
+  const durationMs = startedAt ? ((finishedAt ?? new Date()).getTime() - startedAt.getTime()) : 0;
+  const status = latestTask.status === "RUNNING"
+    ? "running"
+    : latestTask.status === "FAILED"
+      ? "failed"
+      : latestTask.status === "COMPLETED"
+        ? "completed"
+        : latestTask.status === "PENDING"
+          ? "queued"
+          : "idle";
+
+  return {
+    status,
+    workflowKey,
+    runId: latestTask.id,
+    startedAt: startedAt?.toISOString() ?? null,
+    finishedAt: finishedAt?.toISOString() ?? null,
+    durationMs,
+    progress,
+    controls: {
+      paused: false,
+      stopRequested: false,
+      canPause: status === "running",
+      canResume: false,
+      canStop: status === "running" || status === "queued",
+    },
+    results: Array.isArray(result.results)
+      ? result.results.map((r) => ({
+          ...r,
+          body: undefined,
+          bodyPreview: r.body && r.body.length > 0 ? r.body.substring(0, 80) + (r.body.length > 80 ? "..." : "") : (r.bodyPreview || ""),
+        }))
+      : [],
+    history: [
+      {
+        id: latestTask.id,
+        startedAt: startedAt?.toISOString() ?? null,
+        finishedAt: finishedAt?.toISOString() ?? null,
+        status,
+        durationMs: finishedAt ? durationMs : null,
+        progress,
+        summary: String(result.summary || `任务状态：${status}`),
+        batchId: (result.batchId as string | null) ?? null,
+      },
+    ],
+  };
+}
+
+
+async function getLatestWorkflowRunRuntime(workflowKey: WorkflowKey) {
+  const latestRun = await db.workflow_runs.findFirst({
+    where: { workflow_key: workflowKey } as any,
+    orderBy: [
+      { completed_at: "desc" },
+      { started_at: "desc" },
+      { createdAt: "desc" },
+    ],
+  });
+
+  if (!latestRun) return null;
+
+  const latestItems = await db.workflow_run_items.findMany({
+    where: { run_id: latestRun.id } as any,
+    orderBy: { createdAt: "desc" },
+    take: 20,
+  });
+
+  const result = latestRun.result && typeof latestRun.result === "object"
+    ? (latestRun.result as Record<string, any>)
+    : {};
+
+  const progress = {
+    done: Number(latestRun.progress_done ?? 0),
+    total: Number(latestRun.progress_total ?? 0),
+    succeeded: Number(latestRun.progress_succeeded ?? 0),
+    failed: Number(latestRun.progress_failed ?? 0),
+    skipped: Number(latestRun.progress_skipped ?? 0),
+  };
+
+  const startedAt = latestRun.started_at ?? latestRun.createdAt ?? null;
+  const finishedAt = latestRun.completed_at ?? null;
+  const durationMs = startedAt ? ((finishedAt ?? new Date()).getTime() - startedAt.getTime()) : 0;
+  const startedAtIso = startedAt && typeof (startedAt as any).toISOString === "function" ? startedAt.toISOString() : null;
+  const finishedAtIso = finishedAt && typeof (finishedAt as any).toISOString === "function" ? finishedAt.toISOString() : null;
+  const safeItemCreatedAt = (value: unknown) => {
+    if (value && typeof (value as any).toISOString === "function") return (value as Date).toISOString();
+    if (value) {
+      const parsed = new Date(String(value));
+      if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
     }
-  }
+    return null;
+  };
+  const status = latestRun.status === "RUNNING"
 
-  if (!runStatus) {
+    ? "running"
+    : latestRun.status === "FAILED"
+      ? "failed"
+      : latestRun.status === "COMPLETED"
+        ? "completed"
+        : latestRun.status === "PENDING"
+          ? "queued"
+          : "idle";
+
+  return {
+    status,
+    workflowKey,
+    runId: latestRun.id,
+    taskId: latestRun.task_id ?? null,
+    batchId: latestRun.batch_id ?? null,
+    startedAt: startedAtIso,
+    finishedAt: finishedAtIso,
+    durationMs,
+    progress,
+    controls: {
+      paused: false,
+      stopRequested: false,
+      canPause: status === "running",
+      canResume: false,
+      canStop: status === "running" || status === "queued",
+    },
+    results: Array.isArray(result.results)
+      ? result.results.map((r) => ({
+          ...r,
+          body: undefined,
+          bodyPreview: r.body && r.body.length > 0 ? r.body.substring(0, 80) + (r.body.length > 80 ? "..." : "") : (r.bodyPreview || ""),
+        }))
+      : [],
+    items: latestItems.map((item) => ({
+      id: item.id,
+      targetId: item.target_id,
+      email: item.email,
+      status: item.status,
+      reasonCode: item.reason_code,
+      subject: item.subject,
+      error: item.error,
+      createdAt: safeItemCreatedAt(item.createdAt),
+      meta: item.meta,
+    })),
+    history: [
+      {
+        id: latestRun.id,
+        startedAt: startedAtIso,
+        finishedAt: finishedAtIso,
+        status,
+        durationMs: finishedAt ? durationMs : null,
+        progress,
+        summary: String(result.summary || latestRun.error || `任务状态：${status}`),
+        batchId: latestRun.batch_id ?? null,
+      },
+    ],
+  };
+}
+
+
+export async function GET(request: NextRequest) {
+  try {
+    const workflowKey = getWorkflowKey(new URL(request.url).searchParams.get("workflowKey") || undefined);
+
+    const workflowRunRuntime = await getLatestWorkflowRunRuntime(workflowKey);
+    if (workflowRunRuntime) {
+      return NextResponse.json(workflowRunRuntime);
+    }
+
+    const taskRuntime = await getLatestTaskRuntime(workflowKey);
+    if (taskRuntime) {
+      return NextResponse.json(taskRuntime);
+    }
+
+    let runStatus = getRunStatus(workflowKey);
+    let runHistory = getRunHistory(workflowKey);
+
+    // 内存无状态时，尝试从数据库回填（解决服务重启后页面空白的问题）
+    if (!runStatus && runHistory.length === 0) {
+      const dbData = await rebuildStatusFromDB(workflowKey);
+      if (dbData.status) {
+        runStatus = dbData.status;
+        runHistory = dbData.history;
+      }
+    }
+
+    if (!runStatus) {
+      return NextResponse.json({
+        status: "idle",
+        workflowKey,
+        message: "没有正在运行的自动化任务",
+        source: "workflow-runs",
+        history: runHistory.map((item) => ({
+          ...item,
+          startedAt: item.startedAt.toISOString(),
+          finishedAt: item.finishedAt?.toISOString() ?? null,
+        })),
+      });
+    }
+
+
+    const durationMs = runStatus.startedAt ? Date.now() - runStatus.startedAt.getTime() : 0;
+
     return NextResponse.json({
-      status: "idle",
+      status: runStatus.running ? (runStatus.paused ? "paused" : "running") : (runStatus.progress.failed > 0 ? "completed" : "completed"),
       workflowKey,
-      message: "没有正在运行的自动化任务",
+      runId: runStatus.runId,
+      startedAt: runStatus.startedAt?.toISOString(),
+      finishedAt: runStatus.finishedAt?.toISOString() ?? null,
+      durationMs,
+      progress: runStatus.progress,
+      controls: {
+        paused: runStatus.paused,
+        stopRequested: runStatus.stopRequested,
+        canPause: runStatus.running && !runStatus.paused,
+        canResume: runStatus.running && runStatus.paused,
+        canStop: runStatus.running,
+      },
+      results: runStatus.results.map((r) => ({
+        ...r,
+        body: r.body ? undefined : undefined,
+        bodyPreview: r.body && r.body.length > 0 ? r.body.substring(0, 80) + (r.body.length > 80 ? "..." : "") : "",
+      })).filter(Boolean),
       history: runHistory.map((item) => ({
         ...item,
         startedAt: item.startedAt.toISOString(),
         finishedAt: item.finishedAt?.toISOString() ?? null,
       })),
     });
+  } catch (error) {
+    console.error("[AUTO-OUTREACH][GET] failed:", error);
+    return NextResponse.json(
+      {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : null,
+      },
+      { status: 500 },
+    );
   }
-
-  const durationMs = runStatus.startedAt ? Date.now() - runStatus.startedAt.getTime() : 0;
-
-  return NextResponse.json({
-    status: runStatus.running ? (runStatus.paused ? "paused" : "running") : (runStatus.progress.failed > 0 ? "completed" : "completed"),
-    workflowKey,
-    runId: runStatus.runId,
-    startedAt: runStatus.startedAt?.toISOString(),
-    finishedAt: runStatus.finishedAt?.toISOString() ?? null,
-    durationMs,
-    progress: runStatus.progress,
-    controls: {
-      paused: runStatus.paused,
-      stopRequested: runStatus.stopRequested,
-      canPause: runStatus.running && !runStatus.paused,
-      canResume: runStatus.running && runStatus.paused,
-      canStop: runStatus.running,
-    },
-    results: runStatus.results.map((r) => ({
-      ...r,
-      body: r.body ? undefined : undefined,
-      bodyPreview: r.body && r.body.length > 0 ? r.body.substring(0, 80) + (r.body.length > 80 ? "..." : "") : "",
-    })).filter(Boolean),
-    history: runHistory.map((item) => ({
-      ...item,
-      startedAt: item.startedAt.toISOString(),
-      finishedAt: item.finishedAt?.toISOString() ?? null,
-    })),
-  });
 }
+
+
+
 
 
 
@@ -458,80 +676,71 @@ export async function POST(request: NextRequest) {
     const currentStatus = getRunStatus(workflowKey);
     const action = String(body.action || "start").trim();
 
+    const latestWorkflowRunRuntime = await getLatestWorkflowRunRuntime(workflowKey);
+    const latestTaskRuntime = latestWorkflowRunRuntime ? null : await getLatestTaskRuntime(workflowKey);
+    const latestRuntime = latestWorkflowRunRuntime ?? latestTaskRuntime;
+    const hasActiveRuntime = latestRuntime?.status === "running" || latestRuntime?.status === "queued";
+
+    if (!hasActiveRuntime && currentStatus?.running) {
+      setRunStatus(workflowKey, {
+        ...currentStatus,
+        running: false,
+        paused: false,
+        stopRequested: false,
+        finishedAt: currentStatus.finishedAt ?? new Date(),
+      });
+    }
+
     if (action === "pause") {
-      if (!currentStatus?.running) {
+      if (!currentStatus?.running && !hasActiveRuntime) {
         return NextResponse.json({ error: `${getWorkflowLabel(workflowKey)}当前没有运行中的任务` }, { status: 409 });
       }
-      currentStatus.paused = true;
+      if (currentStatus?.running) currentStatus.paused = true;
       return NextResponse.json({ status: "paused", workflowKey, message: "已暂停自动化工作流" });
     }
 
     if (action === "resume") {
-      if (!currentStatus?.running) {
+      if (!currentStatus?.running && !hasActiveRuntime) {
         return NextResponse.json({ error: `${getWorkflowLabel(workflowKey)}当前没有运行中的任务` }, { status: 409 });
       }
-      currentStatus.paused = false;
+      if (currentStatus?.running) currentStatus.paused = false;
       return NextResponse.json({ status: "running", workflowKey, message: "已继续自动化工作流" });
     }
 
     if (action === "stop") {
-      if (!currentStatus?.running) {
+      if (!currentStatus?.running && !hasActiveRuntime) {
         return NextResponse.json({ error: `${getWorkflowLabel(workflowKey)}当前没有运行中的任务` }, { status: 409 });
       }
-      currentStatus.stopRequested = true;
-      currentStatus.paused = false;
+      if (currentStatus?.running) {
+        currentStatus.stopRequested = true;
+        currentStatus.paused = false;
+      }
       return NextResponse.json({ status: "stopping", workflowKey, message: "已请求中止自动化工作流" });
     }
 
-    if (currentStatus?.running) {
+    if (currentStatus?.running || hasActiveRuntime) {
       return NextResponse.json(
-        { error: `${getWorkflowLabel(workflowKey)}已有任务正在运行中，请等待完成或停止后再试`, status: currentStatus },
+        { error: `${getWorkflowLabel(workflowKey)}已有任务正在运行中，请等待完成或停止后再试`, status: latestRuntime ?? currentStatus },
         { status: 409 },
       );
     }
 
-    const {
-      templateName = DEFAULT_TEMPLATE,
-      limit = 9999,
-      offset = 0,
-      dryRun = false,
-      delayMs = 2000,
-      requireEmail = true,
-      fixedSubject = "",
-      fixedBody = "",
-      resumeOnlyUnsent = false,
-      selectedDeveloperIds = [],
-      smtpOverride = null,
-      batchId = null,
-      batchEmails = [],
-    } = body;
+    const normalized = normalizeAutoOutreachJobInput(body);
+    const taskId = crypto.randomUUID();
+    const payload = {
+      ...normalized,
+      requestedAt: new Date().toISOString(),
+    };
 
-    const normalizedSmtpOverride = smtpOverride && typeof smtpOverride === "object"
-      ? {
-          host: String(smtpOverride.host || "").trim(),
-          port: Number(smtpOverride.port || 0),
-          user: String(smtpOverride.user || "").trim(),
-          pass: String(smtpOverride.pass || "").trim(),
-          from: String(smtpOverride.from || "").trim() || undefined,
-        }
-      : null;
+    await ensureWorkflowRun({
+      taskId,
+      workflowKey: normalized.workflowKey,
+      batchId: normalized.batchId,
+      startedAt: new Date(),
+    });
 
-    const normalizedSelectedDeveloperIds = Array.isArray(selectedDeveloperIds)
-      ? selectedDeveloperIds.filter(Boolean)
-      : [];
-    const normalizedBatchId = batchId ? String(batchId).trim() : null;
-    const normalizedBatchEmails = Array.isArray(batchEmails)
-      ? batchEmails.filter((item: unknown) => typeof item === "string" && item.trim()).map((item: string) => item.trim())
-      : [];
-
-    const pureFixedMode = !!(fixedSubject && fixedBody);
-    const outline = templateName in BUILTIN_TEMPLATES
-      ? BUILTIN_TEMPLATES[templateName as keyof typeof BUILTIN_TEMPLATES]
-      : (templateName as string);
-
-    const runId = crypto.randomUUID();
-    const newStatus: RuntimeBucket = {
-      runId,
+    const runtime: RuntimeBucket = {
+      runId: taskId,
       running: true,
       paused: false,
       stopRequested: false,
@@ -539,453 +748,56 @@ export async function POST(request: NextRequest) {
       finishedAt: null,
       progress: { done: 0, total: 0, succeeded: 0, failed: 0, skipped: 0 },
       results: [],
-      batchId: normalizedBatchId,
-      batchEmails: normalizedBatchEmails,
+      batchId: normalized.batchId ?? null,
+      batchEmails: normalized.batchEmails,
     };
+    setRunStatus(workflowKey, runtime);
 
-    setRunStatus(workflowKey, newStatus);
-    const currentHistory = getRunHistory(workflowKey);
-    const historyItem: RunHistoryItem = {
-      id: runId,
-      startedAt: newStatus.startedAt!,
-      finishedAt: null,
-      status: "running",
-      durationMs: null,
-      progress: { ...newStatus.progress },
-      summary: `${getWorkflowLabel(workflowKey)}任务已启动，等待执行中`,
-      batchId: normalizedBatchId,
-    };
+    const result = await executeAutoOutreachJob({ id: taskId, payload, useTaskQueue: false });
+
+    setRunStatus(workflowKey, {
+      ...runtime,
+      running: false,
+      finishedAt: new Date(),
+      progress: result.progress,
+      results: result.results,
+    });
+
+    const existingHistory = getRunHistory(workflowKey);
     setRunHistory(workflowKey, [
-      historyItem,
-      ...currentHistory,
-    ].slice(0, 20));
-
-    console.log(`\n🚀 [AUTO-OUTREACH] 启动自动化邀约工作流 (${getWorkflowLabel(workflowKey)})`);
-    console.log(`   模式: ${pureFixedMode ? "纯固定模板" : "AI 生成"}`);
-    console.log(`   恢复模式: ${resumeOnlyUnsent ? "仅未发送" : "全部候选人"}`);
-    console.log(`   指定开发者: ${normalizedSelectedDeveloperIds.length > 0 ? normalizedSelectedDeveloperIds.length + " 人" : "未指定（按筛选结果）"}`);
-    console.log(`   模板: "${templateName}" (${outline.length} 字符)`);
-    console.log(`   参数: limit=${limit}, offset=${offset}, dryRun=${dryRun}, delay=${delayMs}ms, requireEmail=${requireEmail}\n`);
-
-    executeWorkflow({ workflowKey, outline, limit, offset, dryRun, delayMs, requireEmail, pureFixedMode, fixedSubject, fixedBody, resumeOnlyUnsent, selectedDeveloperIds: normalizedSelectedDeveloperIds, smtpOverride: normalizedSmtpOverride, batchId: normalizedBatchId, batchEmails: normalizedBatchEmails });
+      {
+        id: taskId,
+        startedAt: runtime.startedAt || new Date(),
+        finishedAt: new Date(),
+        status: "completed",
+        durationMs: runtime.startedAt ? Date.now() - runtime.startedAt.getTime() : null,
+        progress: result.progress,
+        summary: `任务完成：成功 ${result.progress.succeeded}，失败 ${result.progress.failed}，跳过 ${result.progress.skipped}`,
+        batchId: normalized.batchId ?? null,
+      },
+      ...existingHistory,
+    ].slice(0, 10));
 
     return NextResponse.json({
-      status: "started",
-      workflowKey,
-      message: "自动化工作流已启动",
-      templateName,
-      dryRun,
-      checkStatus: `/api/automation/auto-outreach?workflowKey=${workflowKey}`,
+      status: "completed",
+      workflowKey: normalized.workflowKey,
+      taskId,
+      batchId: normalized.batchId,
+      message: "自动化任务已启动并执行完成",
+      checkStatus: `/api/automation/auto-outreach?workflowKey=${normalized.workflowKey}`,
+      result,
     });
   } catch (error) {
-    console.error("[AUTO-OUTREACH] 启动失败:", error);
+    console.error("[AUTO-OUTREACH] 直执行失败:", error);
     return NextResponse.json(
-      { error: `启动失败: ${(error as Error).message}` },
+      { error: `执行失败: ${(error as Error).message}` },
       { status: 500 },
     );
   }
 }
 
 
-// ============================================
-// 工作流主逻辑（异步执行）
-// ============================================
-async function executeWorkflow(opts: {
-  workflowKey: WorkflowKey;
-
-  outline: string;
-  limit: number;
-  offset: number;
-  dryRun: boolean;
-  delayMs: number;
-  requireEmail: boolean;
-  pureFixedMode: boolean;
-  fixedSubject: string;
-  fixedBody: string;
-  resumeOnlyUnsent: boolean;
-  selectedDeveloperIds: string[];
-  smtpOverride: { host: string; port: number; user: string; pass: string; from?: string } | null;
-  batchId?: string | null;
-  batchEmails?: string[];
-}) {
-  const { workflowKey, outline, limit, offset, dryRun, delayMs, requireEmail, pureFixedMode, fixedSubject, fixedBody, resumeOnlyUnsent, selectedDeveloperIds, smtpOverride, batchId, batchEmails } = opts;
-  const getCurrentStatus = () => getRunStatus(workflowKey)!;
-  const senderIdentity = smtpOverride?.user || smtpOverride?.from || process.env.EMAIL_FROM || process.env.SMTP_USER || null;
 
 
 
-  try {
-
-    // 1️⃣ 从数据库获取候选人列表（按 ID 升序 = 列表顺序）
-    const whereClause: Record<string, unknown> = {};
-    if (requireEmail) {
-      // SQLite 用 IS NOT NULL AND != '' 过滤空邮箱
-      whereClause.email = { notIn: [""] } as any; // Prisma SQLite 兼容写法
-    }
-
-    const allDevelopers = await db.developers.findMany({
-      where: whereClause as any,
-      orderBy: { createdAt: "asc" }, // 或按 id: "asc"
-      select: {
-        id: true,
-        username: true,
-        display_name: true,
-        bio: true,
-        skillTags: true,
-        techStack: true,
-        location: true,
-        email: true,
-        rawData: true,
-      },
-    });
-
-    // 进一步过滤：确保有邮箱（Prisma 的 notIn 对空字符串可能不完全生效）
-    let filteredDevs = requireEmail
-      ? allDevelopers.filter((d: any) => d.email && d.email.trim() !== "")
-      : allDevelopers;
-
-    // 恢复模式：排除已经成功发送过邮件的候选人，避免重复打扰
-    if (resumeOnlyUnsent) {
-      const sentLogs = await db.outreach_logs.findMany({
-        where: {
-          channel: Channel.EMAIL as any,
-          status: SendStatus.SENT as any,
-          target_type: TargetType.DEVELOPER,
-        },
-        select: { target_id: true },
-      });
-      const sentIds = new Set(sentLogs.map((x: any) => x.target_id).filter(Boolean));
-      filteredDevs = filteredDevs.filter((d: any) => !sentIds.has(d.id));
-      console.log(`[AUTO-OUTREACH] 🔁 恢复模式启用：已过滤 ${sentIds.size} 个已成功发送候选人`);
-    }
-
-    // 邮箱清洗：排除 bot / noreply / 明显格式错误邮箱
-    const beforeDeliverableFilter = filteredDevs.length;
-    filteredDevs = filteredDevs.filter((d: any) => isDeliverableEmail(d.email));
-    console.log(`[AUTO-OUTREACH] 🧹 邮箱清洗：已过滤 ${beforeDeliverableFilter - filteredDevs.length} 个无效/不适合发送邮箱`);
-
-    // 页面手动勾选开发者：只处理指定 ID 列表
-    if (selectedDeveloperIds.length > 0) {
-      const selectedSet = new Set(selectedDeveloperIds);
-      filteredDevs = filteredDevs.filter((d: any) => selectedSet.has(d.id));
-      console.log(`[AUTO-OUTREACH] 🎯 手动选择模式：保留 ${filteredDevs.length} 位开发者`);
-    }
-
-    // 应用 offset + limit
-    let candidates = filteredDevs.slice(offset, offset + limit);
-    const totalCandidates = candidates.length;
-
-    // 邮箱去重：同一邮箱被多个开发者持有时，跳过所有冲突记录（避免发错人）
-    const emailToDevs = new Map<string, any[]>();
-    for (const d of candidates) {
-      if (!d.email) continue;
-      const key = d.email.trim().toLowerCase();
-      if (!emailToDevs.has(key)) emailToDevs.set(key, []);
-      emailToDevs.get(key)!.push(d);
-    }
-    const conflictEmails = new Set<string>();
-    for (const [email, devs] of emailToDevs) {
-      if (devs.length > 1) {
-        conflictEmails.add(email);
-        console.log(`[AUTO-OUTREACH] ⚠️ 邮箱冲突跳过：${email} 被以下 ${devs.length} 位开发者共享 → ${devs.map((d: any) => `${d.display_name||d.username}(${d.id.substring(0,8)})`).join(" / ")}`);
-      }
-    }
-    if (conflictEmails.size > 0) {
-      const beforeDupFilter = candidates.length;
-      candidates = candidates.filter((d: any) => !conflictEmails.has((d.email || "").trim().toLowerCase()));
-      console.log(`[AUTO-OUTREACH] 🛡️ 已跳过 ${beforeDupFilter - candidates.length} 条邮箱冲突记录（${conflictEmails.size} 个重复邮箱）`);
-    }
-
-    if (totalCandidates === 0) {
-      console.log("[AUTO-OUTREACH] ⚠️ 没有找到符合条件的候选人");
-      getCurrentStatus().progress.total = 0;
-      getCurrentStatus().running = false;
-      return;
-    }
-
-    getCurrentStatus().progress.total = candidates.length;
-
-    console.log(`[AUTO-OUTREACH] 📋 找到 ${totalCandidates} 位候选人，开始处理...\n`);
-
-    // 2️⃣ 逐个处理
-    for (let i = 0; i < candidates.length; i++) {
-      const currentStatus = getCurrentStatus();
-      if (currentStatus.stopRequested) {
-        currentStatus.running = false;
-        currentStatus.finishedAt = new Date();
-        const stoppedSummary = `用户中止：完成 ${currentStatus.progress.done}/${currentStatus.progress.total}，成功 ${currentStatus.progress.succeeded}，失败 ${currentStatus.progress.failed}，跳过 ${currentStatus.progress.skipped}`;
-        setRunHistory(workflowKey, getRunHistory(workflowKey).map((item) =>
-          item.id === currentStatus.runId
-            ? {
-                ...item,
-                finishedAt: currentStatus.finishedAt,
-                status: "failed",
-                durationMs: currentStatus.startedAt ? currentStatus.finishedAt!.getTime() - currentStatus.startedAt.getTime() : null,
-                progress: { ...currentStatus.progress },
-                summary: stoppedSummary,
-              }
-            : item,
-        ));
-        console.log(`[AUTO-OUTREACH] ⛔ 用户已中止任务 (${getWorkflowLabel(workflowKey)})`);
-        return;
-      }
-
-      while (getCurrentStatus().paused) {
-        await new Promise((r) => setTimeout(r, 1000));
-        if (getCurrentStatus().stopRequested) break;
-      }
-
-      const dev = candidates[i] as any;
-      const idx = offset + i + 1; // 全局序号（从1开始）
-
-      console.log(`\n[${idx}/${totalCandidates}] 📧 处理 @${dev.username} (${dev.display_name || dev.username})`);
-
-      const resultEntry: any = {
-        id: dev.id,
-        username: dev.username,
-        name: dev.display_name || dev.username,
-        email: dev.email || null,
-        subject: "",
-        body: "",
-        success: false,
-        stage: "generated" as string,
-      };
-
-      try {
-        // ── Step A: 生成邀约文案 ──
-        if (pureFixedMode) {
-          const personName = dev.display_name || dev.username || "你好";
-          const normalizedBody = fixedBody.trim();
-          const personalizedBody = `${personName} 你好，\n${normalizedBody.replace(/^你好[，,]?\s*/u, "")}`;
-          resultEntry.subject = fixedSubject.trim();
-          resultEntry.body = personalizedBody;
-          console.log(`   ✅ 纯固定模板已应用 | 主题: "${resultEntry.subject}"`);
-        } else {
-          // ── Step A: AI 生成邀约文案（通过内部 API 调用，复用已验证的解析逻辑）──
-          let parsedContent: any;
-          
-          try {
-            // 方式1：内部 fetch 调用 /api/ai/generate（最可靠，复用所有解析逻辑）
-            const apiRes = await fetch(`${process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"}/api/ai/generate`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                type: "outreach",
-                data: {
-                  developerName: dev.display_name || dev.username,
-                  developerHighlights: buildHighlights(dev),
-                  callToAction: "期待你的回复",
-                  tone: "professional",
-                  customOutline: outline || undefined,
-                },
-              }),
-            });
-            
-            if (apiRes.ok) {
-              const apiData = await apiRes.json();
-              parsedContent = apiData.content;
-              console.log(`   📡 AI (internal fetch) OK | model: ${apiData.model}`);
-            } else {
-              throw new Error(`API returned ${apiRes.status}`);
-            }
-          } catch (fetchErr) {
-            // 方式2：fallback 到直接调用 aiRouter（如果 internal fetch 失败）
-            console.log(`   ⚠️ Internal fetch failed, fallback to aiRouter: ${(fetchErr as Error).message}`);
-            const aiResult = await aiRouter.generate({
-              taskType: "copywriting",
-              messages: [
-                { role: "system", content: OUTREACH_COPYWRITING_SYSTEM },
-                {
-                  role: "user",
-                  content: outreachMessagePrompt({
-                    developerName: dev.display_name || dev.username,
-                    developerHighlights: buildHighlights(dev),
-                    callToAction: "期待你的回复",
-                    tone: "professional",
-                    customOutline: outline,
-                  }),
-                },
-              ],
-              temperature: 0.8,
-              jsonMode: !outline,
-              preferStream: true,
-              timeoutMs: 60000,
-            });
-
-            // 解析返回内容（使用与 /api/ai/generate 相同的 robust 解析）
-            try {
-              const cleaned = stripMarkdownFence(aiResult.content);
-              parsedContent = JSON.parse(cleaned);
-            } catch {
-              const cleaned = stripMarkdownFence(aiResult.content);
-              const match = cleaned.match(/\{[\s\S]*\}/);
-              if (match) {
-                try { parsedContent = JSON.parse(match[0]); }
-                catch { parsedContent = { raw: cleaned }; }
-              } else {
-                parsedContent = { raw: cleaned };
-              }
-            }
-          }
-
-          const { subject, body } = parseAiResponse(parsedContent);
-          resultEntry.subject = subject;
-          resultEntry.body = body;
-          console.log(`   ✅ 文案生成成功 | 主题: "${subject}"`);
-        }
-
-        const subject = resultEntry.subject;
-        const body = resultEntry.body;
-
-        // ── Step B: 发送邮件（非 dryRun 时）──
-        if (!dryRun && dev.email) {
-          await new Promise((r) => setTimeout(r, Math.min(delayMs, 500))); // 发送前短暂延迟
-
-          const sendResult = await sendEmail({
-            to: dev.email!,
-            subject: subject,
-            html: body.includes("<") ? body : `<p>${body.replace(/\n/g, "<br/>")}</p>`,
-            text: body,
-            providerOverride: smtpOverride ? "nodemailer" : undefined,
-            smtpOverride: smtpOverride || undefined,
-            from: smtpOverride?.from,
-          });
-
-          const logPayload = {
-            id: crypto.randomUUID(),
-            target_type: TargetType.DEVELOPER,
-            target_id: dev.id,
-            channel: Channel.EMAIL as any,
-            subject: subject,
-            body: body,
-            template_id: null,
-            ai_generated: !pureFixedMode,
-            status: sendResult.success ? (SendStatus.SENT as any) : (SendStatus.FAILED as any),
-            sent_at: new Date(),
-            error: sendResult.success ? null : (sendResult.error || "发送失败"),
-            sent_by: senderIdentity,
-            campaign_id: null,
-            ai_prompt: batchId ? JSON.stringify({ batchId, batchEmails, workflowKey }) : null,
-            updatedAt: new Date(),
-          };
-
-          if (sendResult.success) {
-            resultEntry.success = true;
-            resultEntry.stage = "sent";
-            getCurrentStatus().progress.succeeded++;
-            console.log(`   ✅ 邮件已发送 → ${dev.email} [${sendResult.provider}]`);
-
-            try {
-              await db.outreach_logs.create({ data: logPayload });
-            } catch (logErr) {
-              console.warn(`   ⚠️ 日志记录失败: ${(logErr as Error).message}`);
-            }
-
-            try {
-              await db.developers.update({
-                where: { id: dev.id },
-                data: { status: "CONTACTED", updatedAt: new Date() } as any,
-              });
-            } catch (statusErr) {
-              console.warn(`   ⚠️ 状态更新失败: ${(statusErr as Error).message}`);
-            }
-          } else {
-            resultEntry.stage = "failed";
-            resultEntry.error = sendResult.error || "发送失败";
-            getCurrentStatus().progress.failed++;
-            console.log(`   ❌ 发送失败: ${resultEntry.error}`);
-
-            try {
-              await db.outreach_logs.create({ data: logPayload });
-            } catch (logErr) {
-              console.warn(`   ⚠️ 失败日志记录失败: ${(logErr as Error).message}`);
-            }
-          }
-        } else if (dryRun) {
-          // dryRun 模式：只记录为 generated
-          resultEntry.success = true;
-          resultEntry.stage = "generated";
-          getCurrentStatus().progress.succeeded++;
-          console.log(`   🔍 [DRY RUN] 仅预览，未发送`);
-        } else {
-          // 无邮箱
-          resultEntry.stage = "skipped";
-          resultEntry.error = "无邮箱地址";
-          getCurrentStatus().progress.skipped++;
-          console.log(`   ⏭️ 跳过（无邮箱）`);
-        }
-      } catch (genError) {
-        resultEntry.stage = "failed";
-        resultEntry.error = (genError as Error).message || "AI 生成异常";
-        getCurrentStatus().progress.failed++;
-        console.log(`   ❌ 处理异常: ${resultEntry.error}`);
-      }
-
-      getCurrentStatus().results.push(resultEntry);
-      getCurrentStatus().progress.done++;
-
-      // 请求间隔（防限流），最后一个不用等
-      if (i < candidates.length - 1) {
-        await new Promise((r) => setTimeout(r, delayMs));
-      }
-    }
-
-    // 3️⃣ 完成
-    getCurrentStatus().running = false;
-    getCurrentStatus().finishedAt = new Date();
-
-    const currentStatus = getCurrentStatus();
-    const summary = `完成 ${currentStatus.progress.done}/${currentStatus.progress.total}，成功 ${currentStatus.progress.succeeded}，失败 ${currentStatus.progress.failed}，跳过 ${currentStatus.progress.skipped}`;
-    setRunHistory(workflowKey, getRunHistory(workflowKey).map((item) =>
-      item.id === currentStatus.runId
-        ? {
-            ...item,
-            finishedAt: currentStatus.finishedAt,
-            status: currentStatus.progress.failed > 0 ? "completed" : "completed",
-            durationMs: currentStatus.startedAt ? currentStatus.finishedAt!.getTime() - currentStatus.startedAt.getTime() : null,
-            progress: { ...currentStatus.progress },
-            summary,
-          }
-        : item,
-    ));
-
-    console.log(`\n${"=".repeat(60)}`);
-    console.log(`🏁 [AUTO-OUTREACH] 工作流完成！ (${getWorkflowLabel(workflowKey)})`);
-    console.log(`   总计: ${currentStatus.progress.done}/${currentStatus.progress.total}`);
-    console.log(`   成功: ${currentStatus.progress.succeeded}`);
-    console.log(`   失败: ${currentStatus.progress.failed}`);
-    console.log(`   跳过: ${currentStatus.progress.skipped}`);
-    console.log(`${"=".repeat(60)}\n`);
-  } catch (fatalError) {
-    console.error("[AUTO-OUTREACH] 💥 致命错误:", fatalError);
-    const currentStatus = getRunStatus(workflowKey);
-    if (currentStatus) {
-      currentStatus.running = false;
-      currentStatus.finishedAt = new Date();
-      currentStatus.results.push({
-        id: "fatal",
-        username: "_system_",
-        name: "系统错误",
-        email: null,
-        subject: "",
-        body: "",
-        success: false,
-        error: (fatalError as Error).message,
-        stage: "failed",
-      });
-      setRunHistory(workflowKey, getRunHistory(workflowKey).map((item) =>
-        item.id === currentStatus.runId
-          ? {
-              ...item,
-              finishedAt: currentStatus.finishedAt,
-              status: "failed",
-              durationMs: currentStatus.startedAt ? currentStatus.finishedAt!.getTime() - currentStatus.startedAt.getTime() : null,
-              progress: { ...currentStatus.progress },
-              summary: `致命错误：${(fatalError as Error).message}`,
-            }
-          : item,
-      ));
-    }
-  }
-}
 
